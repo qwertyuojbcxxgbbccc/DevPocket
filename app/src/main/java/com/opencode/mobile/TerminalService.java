@@ -23,21 +23,22 @@ public class TerminalService {
     private static final String ROOTFS_DIR  = "usr";
     private static final String BOOT_MARKER = ".boot_complete";
 
-    // ✅ روابط proot مع fallback — مرتّبة حسب الأولوية
+    // ✅ proot — روابط مجربة مع fallback
     private static final String[] PROOT_URLS = {
-        // GitHub Pages (ثابت ولا يتغير)
+        // GitHub Pages ثابت لا يتغير
         "https://skirsten.github.io/proot-portable-android-binaries/aarch64/proot",
         // jsDelivr CDN من نفس المصدر
-        "https://cdn.jsdelivr.net/gh/skirsten/proot-portable-android-binaries@latest/aarch64/proot",
-        // نسخة محددة من termux (v5.1.107-1 الصحيحة)
-        "https://github.com/termux/proot/releases/download/v5.1.107-1/proot-aarch64"
+        "https://cdn.jsdelivr.net/gh/skirsten/proot-portable-android-binaries@latest/aarch64/proot"
     };
 
-    // ✅ busybox من Alpine CDN — arm64 musl static
+    // ✅ busybox — binary مباشر مخصص لـ Android (بدون APK)
     private static final String[] BUSYBOX_URLS = {
-        "https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/busybox-static-1.36.1-r2.apk",
-        "https://dl-cdn.alpinelinux.org/alpine/v3.19/main/aarch64/busybox-static-1.36.1-r2.apk",
-        "https://dl-cdn.alpinelinux.org/alpine/v3.18/main/aarch64/busybox-static-1.36.1-r0.apk"
+        // EXALAB — مُجمَّع خصيصاً لأجهزة Android
+        "https://raw.githubusercontent.com/EXALAB/Busybox-static/main/busybox_arm64",
+        // xerta555 — نسخة بديلة arm64
+        "https://raw.githubusercontent.com/xerta555/Busybox-Binaries/master/busybox-arm64",
+        // shutingrz — busybox 1.36.0 aarch64 static
+        "https://raw.githubusercontent.com/shutingrz/busybox-static-binaries-fat/main/busybox-aarch64-linux-gnu"
     };
 
     private final Context context;
@@ -92,7 +93,7 @@ public class TerminalService {
     }
 
     // -----------------------------------------------------------------------
-    // تحميل proot و busybox مع دعم fallback
+    // تحميل proot و busybox — binary مباشر بدون APK
     // -----------------------------------------------------------------------
     private void doDownloadBinariesThenInstall() {
         File filesDir    = context.getFilesDir();
@@ -100,42 +101,37 @@ public class TerminalService {
         File busyboxFile = new File(filesDir, "busybox");
 
         try {
-            // --- proot (مع fallback) ---
+            // --- proot ---
             if (!prootFile.exists() || prootFile.length() < 100_000) {
                 notifyProgress(8, "Downloading proot... (تحميل proot)");
-                boolean downloaded = downloadFileWithFallback(PROOT_URLS, prootFile, 8, 25);
-                if (downloaded) {
+                boolean ok = downloadFileWithFallback(PROOT_URLS, prootFile, 8, 28);
+                if (ok) {
                     prootFile.setExecutable(true);
                     Log.d(TAG, "proot OK: " + prootFile.length() + " bytes");
                 }
             }
 
             if (!prootFile.exists() || prootFile.length() < 100_000) {
-                notifyError(
-                    "proot download failed",
-                    "All download sources failed.\nTried:\n- " + String.join("\n- ", PROOT_URLS)
-                );
+                notifyError("proot download failed",
+                    "All sources failed. Check internet connection.\nTried:\n"
+                    + String.join("\n", PROOT_URLS));
                 return;
             }
 
-            // --- busybox (مع fallback) ---
+            // --- busybox: binary مباشر بدون APK ---
             if (!busyboxFile.exists() || busyboxFile.length() < 100_000) {
-                notifyProgress(28, "Downloading busybox... (تحميل busybox)");
-                File apkFile = new File(filesDir, "busybox.apk");
-                boolean downloaded = downloadFileWithFallback(BUSYBOX_URLS, apkFile, 28, 42);
-                if (downloaded) {
-                    extractBusyboxFromApk(apkFile, busyboxFile);
-                    apkFile.delete();
+                notifyProgress(30, "Downloading busybox... (تحميل busybox)");
+                boolean ok = downloadFileWithFallback(BUSYBOX_URLS, busyboxFile, 30, 46);
+                if (ok) {
                     busyboxFile.setExecutable(true);
                     Log.d(TAG, "busybox OK: " + busyboxFile.length() + " bytes");
                 }
             }
 
             if (!busyboxFile.exists() || busyboxFile.length() < 100_000) {
-                notifyError(
-                    "busybox download failed",
-                    "All download sources failed.\nTried:\n- " + String.join("\n- ", BUSYBOX_URLS)
-                );
+                notifyError("busybox download failed",
+                    "All sources failed. Check internet connection.\nTried:\n"
+                    + String.join("\n", BUSYBOX_URLS));
                 return;
             }
 
@@ -156,65 +152,26 @@ public class TerminalService {
     // -----------------------------------------------------------------------
     private boolean downloadFileWithFallback(String[] urls, File outFile,
                                               int startPct, int endPct) {
-        Exception lastError = null;
         for (int i = 0; i < urls.length; i++) {
             String url = urls[i];
             try {
-                notifyProgress(startPct, "Trying source " + (i + 1) + "/" + urls.length + "...");
-                Log.d(TAG, "Downloading from: " + url);
+                notifyProgress(startPct,
+                    "Trying source " + (i + 1) + "/" + urls.length + "...");
+                Log.d(TAG, "Downloading: " + url);
                 downloadFile(url, outFile, startPct, endPct);
                 if (outFile.exists() && outFile.length() > 100_000) {
-                    Log.d(TAG, "✅ Downloaded OK from: " + url);
+                    Log.d(TAG, "✅ OK from: " + url + " [" + outFile.length() + " bytes]");
                     return true;
                 } else {
-                    Log.w(TAG, "⚠️ File too small from: " + url + " size=" + outFile.length());
+                    Log.w(TAG, "⚠️ Too small from: " + url
+                        + " [" + outFile.length() + " bytes]");
                 }
             } catch (Exception e) {
-                lastError = e;
                 Log.w(TAG, "❌ Failed [" + url + "]: " + e.getMessage());
-                if (outFile.exists()) outFile.delete(); // cleanup قبل المحاولة التالية
             }
+            if (outFile.exists()) outFile.delete(); // cleanup قبل المحاولة التالية
         }
-        Log.e(TAG, "All sources failed. Last error: " + (lastError != null ? lastError.getMessage() : "unknown"));
         return false;
-    }
-
-    // -----------------------------------------------------------------------
-    // استخراج busybox من Alpine APK (zip)
-    // -----------------------------------------------------------------------
-    private void extractBusyboxFromApk(File apkFile, File outFile) throws Exception {
-        java.util.zip.ZipFile zip = new java.util.zip.ZipFile(apkFile);
-
-        // جرّب المسارات المحتملة داخل APK
-        String[] possiblePaths = { "bin/busybox", "usr/bin/busybox", "busybox" };
-        java.util.zip.ZipEntry entry = null;
-        for (String path : possiblePaths) {
-            entry = zip.getEntry(path);
-            if (entry != null) {
-                Log.d(TAG, "Found busybox at: " + path);
-                break;
-            }
-        }
-
-        if (entry == null) {
-            zip.close();
-            // طباعة محتويات الـ APK للتشخيص
-            StringBuilder contents = new StringBuilder();
-            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zip.entries();
-            while (entries.hasMoreElements()) {
-                contents.append(entries.nextElement().getName()).append("\n");
-            }
-            throw new Exception("busybox entry not found inside APK.\nContents:\n" + contents);
-        }
-
-        InputStream in  = zip.getInputStream(entry);
-        FileOutputStream fos = new FileOutputStream(outFile);
-        byte[] buf = new byte[8192];
-        int n;
-        while ((n = in.read(buf)) != -1) fos.write(buf, 0, n);
-        fos.close();
-        in.close();
-        zip.close();
     }
 
     // -----------------------------------------------------------------------
@@ -272,20 +229,29 @@ public class TerminalService {
             File prootTmp = new File(filesDir, "proot-tmp");
             if (!prootTmp.exists()) prootTmp.mkdirs();
 
-            notifyProgress(46, "Updating package manager... (تحديث مدير الحزم)");
+            notifyProgress(48, "Updating package manager... (تحديث مدير الحزم)");
             boolean ok = runInProot(prootPath, rootfsPath, prootTmp.getAbsolutePath(),
                 "apk update --no-cache");
-            if (!ok) { notifyError("apk update failed", "Check network connectivity"); return; }
+            if (!ok) {
+                notifyError("apk update failed", "Check network connectivity");
+                return;
+            }
 
-            notifyProgress(60, "Installing Node.js & npm... (تثبيت النود)");
+            notifyProgress(62, "Installing Node.js & npm... (تثبيت النود)");
             ok = runInProot(prootPath, rootfsPath, prootTmp.getAbsolutePath(),
                 "apk add --no-cache nodejs npm git");
-            if (!ok) { notifyError("apk add failed", "Could not install nodejs/npm"); return; }
+            if (!ok) {
+                notifyError("apk add failed", "Could not install nodejs/npm");
+                return;
+            }
 
             notifyProgress(78, "Installing opencode-ai... (تثبيت أوبن كود)");
             ok = runInProot(prootPath, rootfsPath, prootTmp.getAbsolutePath(),
                 "npm install -g opencode-ai@latest");
-            if (!ok) { notifyError("npm install failed", "Could not install opencode-ai"); return; }
+            if (!ok) {
+                notifyError("npm install failed", "Could not install opencode-ai");
+                return;
+            }
 
             new File(rootfsDir, BOOT_MARKER).createNewFile();
             firstBoot = false;
@@ -324,8 +290,7 @@ public class TerminalService {
                 new InputStreamReader(proc.getInputStream()));
             String line;
             while ((line = reader.readLine()) != null) {
-                final String l = line;
-                if (bridge != null) bridge.onTerminalData(l + "\r\n");
+                if (bridge != null) bridge.onTerminalData(line + "\r\n");
             }
             int exit = proc.waitFor();
             Log.d(TAG, "[" + cmd + "] exit=" + exit);
@@ -429,7 +394,9 @@ public class TerminalService {
         isRunning.set(false);
         writeExecutor.submit(() -> {
             writeDirectly("exit\n");
-            try { if (shellProcess != null) shellProcess.destroy(); } catch (Exception ignored) {}
+            try {
+                if (shellProcess != null) shellProcess.destroy();
+            } catch (Exception ignored) {}
         });
     }
 
