@@ -7,6 +7,7 @@ import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -21,14 +22,13 @@ public class TerminalService {
     private static final String BOOT_MARKER = ".boot_complete";
 
     private final Context context;
-    private final AlpineBootstrap alpineBootstrap;
     private final ExecutorService executor;
+    // FIX #1: Separate executor for write() so it never blocks the main pipeline
+    private final ExecutorService writeExecutor;
     private final Handler mainHandler;
 
     private Process shellProcess;
     private OutputStream shellInput;
-    private BufferedReader shellOutput;
-    private BufferedReader shellError;
 
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
     private volatile boolean firstBoot = false;
@@ -37,8 +37,9 @@ public class TerminalService {
 
     public TerminalService(Context context) {
         this.context = context;
-        this.alpineBootstrap = new AlpineBootstrap(context);
-        this.executor = Executors.newSingleThreadExecutor();
+        // FIX #1: Use a thread pool — no more single-thread deadlock
+        this.executor = Executors.newCachedThreadPool();
+        this.writeExecutor = Executors.newSingleThreadExecutor();
         this.mainHandler = new Handler(Looper.getMainLooper());
     }
 
@@ -51,242 +52,260 @@ public class TerminalService {
     }
 
     public void checkInstallStatus() {
-        executor.execute(() -> {
+        // FIX #1: runs on its own thread, does NOT chain via executor.execute() internally
+        executor.submit(() -> {
             File rootfsDir = new File(context.getFilesDir(), ROOTFS_DIR);
             File bootMarker = new File(rootfsDir, BOOT_MARKER);
 
-            if (!rootfsDir.exists() || !rootfsDir.isDirectory() ||
-                rootfsDir.listFiles() == null || rootfsDir.listFiles().length == 0) {
+            boolean rootfsEmpty = !rootfsDir.exists()
+                || !rootfsDir.isDirectory()
+                || rootfsDir.listFiles() == null
+                || rootfsDir.listFiles().length == 0;
+
+            if (rootfsEmpty || !bootMarker.exists()) {
                 firstBoot = true;
                 notifyProgress(5, "Preparing environment... (جاري تجهيز البيئة)");
-                extractRootfs();
-            } else if (!bootMarker.exists()) {
-                firstBoot = true;
-                notifyProgress(10, "Resuming setup... (جاري استئناف التثبيت)");
-                extractRootfs();
+                // FIX #1: call directly, not via executor.execute()
+                doExtractAndInstall();
             } else {
                 firstBoot = false;
                 notifyProgress(10, "Environment ready. Starting terminal...");
-                startShell();
+                doStartShell();
             }
         });
     }
 
-    private void extractRootfs() {
-        executor.execute(() -> {
-            try {
-                File rootfsDir = new File(context.getFilesDir(), ROOTFS_DIR);
-                if (!rootfsDir.exists()) {
-                    rootfsDir.mkdirs();
-                }
+    // -----------------------------------------------------------------------
+    // FIX #2 + #3: Real extraction using ProcessBuilder per command.
+    // No fake "Log.d and pretend" execution.
+    // -----------------------------------------------------------------------
+    private void doExtractAndInstall() {
+        try {
+            File filesDir = context.getFilesDir();
+            File rootfsDir = new File(filesDir, ROOTFS_DIR);
+            if (!rootfsDir.exists()) rootfsDir.mkdirs();
 
-                notifyProgress(15, "Extracting base system... (جاري فك الضغط)");
+            notifyProgress(15, "Extracting base system... (جاري فك الضغط)");
 
-                // Copy bundled busybox/PRoot binaries from assets
-                copyBinaryFromAssets("busybox", "busybox");
-                copyBinaryFromAssets("proot", "proot");
+            // FIX #2: Copy binaries — warn and fall back gracefully if assets missing
+            copyBinaryFromAssets("busybox", "busybox");
+            copyBinaryFromAssets("proot", "proot");
 
-                // Make binaries executable
-                File busyboxFile = new File(context.getFilesDir(), "busybox");
-                File prootFile = new File(context.getFilesDir(), "proot");
-                busyboxFile.setExecutable(true);
-                prootFile.setExecutable(true);
+            File prootFile = new File(filesDir, "proot");
+            File busyboxFile = new File(filesDir, "busybox");
 
-                notifyProgress(25, "Setting up package manager... (جاري إعداد مدير الحزم)");
-
-                // Set up Alpine using apk via proot
-                String[] setupCommands = {
-                    "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH",
-                    "apk update --no-cache",
-                    "apk add --no-cache nodejs npm git",
-                    "npm install -g opencode-ai@latest",
-                    "touch " + rootfsDir.getAbsolutePath() + "/" + BOOT_MARKER
-                };
-
-                for (int i = 0; i < setupCommands.length; i++) {
-                    String cmd = setupCommands[i];
-                    Log.d(TAG, "Running: " + cmd);
-                    int progress = 30 + (i * 15);
-                    notifyProgress(Math.min(progress, 85), "Configuring: " + cmd);
-                }
-
-                // Mark boot complete
-                File bootMarker = new File(rootfsDir, BOOT_MARKER);
-                bootMarker.createNewFile();
-
-                firstBoot = false;
-                notifyProgress(90, "Setup complete! Starting server... (اكتمل التثبيت)");
-
-                startShell();
-
-            } catch (Exception e) {
-                Log.e(TAG, "Rootfs extraction failed", e);
-                notifyError("Setup Failed", "Could not initialize environment: " + e.getMessage());
+            // FIX #2: If proot/busybox not available in assets, notify error clearly
+            if (!prootFile.exists() || !busyboxFile.exists()) {
+                notifyError(
+                    "Missing binaries (ملفات مفقودة)",
+                    "proot/busybox not found in assets/bin/. " +
+                    "Add arm64 builds to app/src/main/assets/bin/ and rebuild."
+                );
+                return;
             }
-        });
+
+            // FIX #3: Actually run each setup command via ProcessBuilder
+            String rootfsPath = rootfsDir.getAbsolutePath();
+            String prootPath  = prootFile.getAbsolutePath();
+
+            notifyProgress(25, "Updating package manager... (تحديث مدير الحزم)");
+            boolean ok = runInProot(prootPath, rootfsPath, "apk update --no-cache", 30);
+            if (!ok) { notifyError("apk update failed", "Check network connectivity"); return; }
+
+            notifyProgress(45, "Installing Node.js & npm... (تثبيت النود)");
+            ok = runInProot(prootPath, rootfsPath, "apk add --no-cache nodejs npm git", 60);
+            if (!ok) { notifyError("apk add failed", "Could not install nodejs/npm"); return; }
+
+            notifyProgress(70, "Installing opencode-ai... (تثبيت أوبن كود)");
+            ok = runInProot(prootPath, rootfsPath, "npm install -g opencode-ai@latest", 85);
+            if (!ok) { notifyError("npm install failed", "Could not install opencode-ai"); return; }
+
+            // FIX #3: Only write BOOT_MARKER after real successful installation
+            File bootMarker = new File(rootfsDir, BOOT_MARKER);
+            bootMarker.createNewFile();
+            firstBoot = false;
+
+            notifyProgress(90, "Setup complete! Starting server... (اكتمل التثبيت)");
+            doStartShell();
+
+        } catch (Exception e) {
+            Log.e(TAG, "Install failed", e);
+            notifyError("Setup Failed", "Could not initialize environment: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Runs a single shell command inside proot chroot.
+     * Returns true if exit code == 0.
+     */
+    private boolean runInProot(String prootPath, String rootfsPath, String cmd, int progressHint) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(
+                prootPath,
+                "-r", rootfsPath,
+                "-b", "/dev",
+                "-b", "/proc",
+                "-b", "/sys",
+                "-w", "/root",
+                "/bin/sh", "-c", cmd
+            );
+            pb.environment().put("HOME", "/root");
+            pb.environment().put("TERM", "xterm-256color");
+            pb.environment().put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+            pb.environment().put("LD_PRELOAD", "");
+            pb.redirectErrorStream(true);
+
+            Process proc = pb.start();
+
+            // Stream output to UI
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(proc.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                final String l = line;
+                if (bridge != null) bridge.onTerminalData(l + "\r\n");
+            }
+
+            int exitCode = proc.waitFor();
+            Log.d(TAG, "Command [" + cmd + "] exit=" + exitCode);
+            return exitCode == 0;
+
+        } catch (Exception e) {
+            Log.e(TAG, "runInProot error: " + e.getMessage());
+            return false;
+        }
     }
 
     private void copyBinaryFromAssets(String assetName, String outputName) {
         try {
             File outFile = new File(context.getFilesDir(), outputName);
-            if (outFile.exists()) return;
-
+            if (outFile.exists()) {
+                outFile.setExecutable(true);
+                return;
+            }
             InputStream is = context.getAssets().open("bin/" + assetName);
             java.io.FileOutputStream fos = new java.io.FileOutputStream(outFile);
             byte[] buffer = new byte[8192];
             int len;
-            while ((len = is.read(buffer)) != -1) {
-                fos.write(buffer, 0, len);
-            }
+            while ((len = is.read(buffer)) != -1) fos.write(buffer, 0, len);
             fos.close();
             is.close();
             outFile.setExecutable(true);
-            Log.d(TAG, "Copied binary: " + assetName + " -> " + outputName);
+            Log.d(TAG, "Copied binary: " + assetName);
         } catch (Exception e) {
             Log.w(TAG, "Could not copy binary " + assetName + ": " + e.getMessage());
         }
     }
 
-    private void startShell() {
-        executor.execute(() -> {
-            try {
-                File rootfsDir = new File(context.getFilesDir(), ROOTFS_DIR);
-                String rootfsPath = rootfsDir.getAbsolutePath();
+    // -----------------------------------------------------------------------
+    // Shell startup — runs on its own thread, NOT inside executor.execute()
+    // -----------------------------------------------------------------------
+    private void doStartShell() {
+        try {
+            File filesDir  = context.getFilesDir();
+            File rootfsDir = new File(filesDir, ROOTFS_DIR);
+            String rootfsPath = rootfsDir.getAbsolutePath();
 
-                String[] env = {
-                    "HOME=/root",
-                    "TERM=xterm-256color",
-                    "SHELL=/bin/sh",
-                    "USER=root",
-                    "PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin",
-                    "LD_PRELOAD="
-                };
+            File prootFile = new File(filesDir, "proot");
+            ProcessBuilder pb;
 
-                // Try to start a shell via PRoot, fall back to sh
-                ProcessBuilder pb;
-                File prootFile = new File(context.getFilesDir(), "proot");
-                if (prootFile.exists()) {
-                    pb = new ProcessBuilder(
-                        prootFile.getAbsolutePath(),
-                        "-r", rootfsPath,
-                        "-b", "/dev",
-                        "-b", "/proc",
-                        "-b", "/sys",
-                        "-w", "/root",
-                        "/bin/sh"
-                    );
-                } else {
-                    pb = new ProcessBuilder("/system/bin/sh");
-                }
-
-                pb.environment().putAll(System.getenv());
-                for (String e : env) {
-                    String[] parts = e.split("=", 2);
-                    if (parts.length == 2) {
-                        pb.environment().put(parts[0], parts[1]);
-                    }
-                }
-                pb.directory(rootfsDir);
-
-                shellProcess = pb.start();
-                shellInput = shellProcess.getOutputStream();
-                shellOutput = new BufferedReader(new InputStreamReader(shellProcess.getInputStream()));
-                shellError = new BufferedReader(new InputStreamReader(shellProcess.getErrorStream()));
-
-                isRunning.set(true);
-
-                // Start output reader threads
-                startOutputReader(shellOutput);
-                startOutputReader(shellError);
-
-                notifyProgress(95, "Launching OpenCode Engine... (بدء تشغيل المحرك)");
-
-                // Start the opencode server
-                write("opencode serve\n");
-
-                isRunning.set(true);
-
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to start shell", e);
-                notifyError("Shell Error", "Could not start terminal: " + e.getMessage());
+            if (prootFile.exists()) {
+                pb = new ProcessBuilder(
+                    prootFile.getAbsolutePath(),
+                    "-r", rootfsPath,
+                    "-b", "/dev",
+                    "-b", "/proc",
+                    "-b", "/sys",
+                    "-w", "/root",
+                    "/bin/sh"
+                );
+            } else {
+                pb = new ProcessBuilder("/system/bin/sh");
             }
-        });
+
+            pb.environment().put("HOME", "/root");
+            pb.environment().put("TERM", "xterm-256color");
+            pb.environment().put("SHELL", "/bin/sh");
+            pb.environment().put("USER", "root");
+            pb.environment().put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+            pb.environment().put("LD_PRELOAD", "");
+            pb.directory(rootfsDir.exists() ? rootfsDir : filesDir);
+
+            shellProcess = pb.start();
+            shellInput   = shellProcess.getOutputStream();
+            isRunning.set(true);
+
+            // Start async readers (on their own threads, not blocking executor)
+            startOutputReader(new BufferedReader(
+                new InputStreamReader(shellProcess.getInputStream())));
+            startOutputReader(new BufferedReader(
+                new InputStreamReader(shellProcess.getErrorStream())));
+
+            notifyProgress(95, "Launching OpenCode Engine... (بدء تشغيل المحرك)");
+
+            // FIX #1: write directly — no executor queue involved
+            writeDirectly("opencode serve\n");
+
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to start shell", e);
+            notifyError("Shell Error", "Could not start terminal: " + e.getMessage());
+        }
     }
 
     private void startOutputReader(final BufferedReader reader) {
-        Thread readerThread = new Thread(() -> {
+        Thread t = new Thread(() -> {
             try {
-                StringBuilder buffer = new StringBuilder();
-                char[] charBuffer = new char[4096];
-                int charsRead;
-
-                while (isRunning.get() && (charsRead = reader.read(charBuffer, 0, charBuffer.length)) != -1) {
-                    String chunk = new String(charBuffer, 0, charsRead);
-                    buffer.append(chunk);
-
-                    // Emit data in chunks
-                    if (buffer.length() > 0) {
-                        String data = buffer.toString();
-                        buffer.setLength(0);
-
-                        if (bridge != null) {
-                            bridge.onTerminalData(data);
-                        }
-
-                        // Check for the URL pattern
-                        if (data.contains("http://127.0.0.1:4096")) {
+                char[] buf = new char[4096];
+                int n;
+                while (isRunning.get() && (n = reader.read(buf, 0, buf.length)) != -1) {
+                    String chunk = new String(buf, 0, n);
+                    if (bridge != null) {
+                        bridge.onTerminalData(chunk);
+                        if (chunk.contains("http://127.0.0.1:4096")) {
                             bridge.onReady();
                         }
                     }
                 }
             } catch (Exception e) {
-                Log.e(TAG, "Output reader error", e);
+                Log.e(TAG, "Output reader error: " + e.getMessage());
             }
         });
-        readerThread.setDaemon(true);
-        readerThread.start();
+        t.setDaemon(true);
+        t.start();
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX #1: writeDirectly() — bypasses executor entirely for shell I/O
+    // public write() still goes via writeExecutor to serialize concurrent calls
+    // -----------------------------------------------------------------------
+    private void writeDirectly(String data) {
+        try {
+            if (shellInput != null && isRunning.get()) {
+                shellInput.write(data.getBytes("UTF-8"));
+                shellInput.flush();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "writeDirectly error: " + e.getMessage());
+        }
     }
 
     public void write(String command) {
-        executor.execute(() -> {
-            try {
-                if (shellInput != null) {
-                    shellInput.write(command.getBytes());
-                    shellInput.flush();
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Write error", e);
-            }
-        });
+        writeExecutor.submit(() -> writeDirectly(command));
     }
 
     public void stop() {
         isRunning.set(false);
-        executor.execute(() -> {
-            try {
-                if (shellInput != null) {
-                    shellInput.write("exit\n".getBytes());
-                    shellInput.flush();
-                }
-            } catch (Exception ignored) {}
-
-            try {
-                if (shellProcess != null) {
-                    shellProcess.destroy();
-                }
-            } catch (Exception ignored) {}
+        writeExecutor.submit(() -> {
+            writeDirectly("exit\n");
+            try { if (shellProcess != null) shellProcess.destroy(); } catch (Exception ignored) {}
         });
     }
 
     private void notifyProgress(int percent, String message) {
-        if (bridge != null) {
-            bridge.onInstallProgress(percent, message);
-        }
+        if (bridge != null) bridge.onInstallProgress(percent, message);
     }
 
     private void notifyError(String title, String details) {
-        if (bridge != null) {
-            bridge.onError(title, details);
-        }
+        if (bridge != null) bridge.onError(title, details);
     }
 }
