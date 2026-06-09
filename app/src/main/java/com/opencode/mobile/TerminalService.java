@@ -20,14 +20,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class TerminalService {
 
     private static final String TAG = "TerminalService";
-    private static final String ROOTFS_DIR = "usr";
+    private static final String ROOTFS_DIR  = "usr";
     private static final String BOOT_MARKER = ".boot_complete";
 
-    // روابط تحميل ثابتة من GitHub Releases — arm64 static builds
-    private static final String PROOT_URL =
-        "https://github.com/termux/proot/releases/download/v5.1.107/proot-aarch64";
-    private static final String BUSYBOX_URL =
-        "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox-armv8l";
+    // ✅ روابط محدثة ومستقرة
+    private static final String PROOT_URL = "https://github.com/termux/proot/releases/download/v5.3.1/proot-aarch64";
+    private static final String BUSYBOX_URL = "https://dl-cdn.alpinelinux.org/alpine/v3.19/main/aarch64/busybox-static-1.36.1-r6.apk";
 
     private final Context context;
     private final ExecutorService executor;
@@ -43,8 +41,8 @@ public class TerminalService {
     private WebAppInterface bridge;
 
     public TerminalService(Context context) {
-        this.context = context;
-        this.executor = Executors.newCachedThreadPool();
+        this.context     = context;
+        this.executor    = Executors.newCachedThreadPool();
         this.writeExecutor = Executors.newSingleThreadExecutor();
         this.mainHandler = new Handler(Looper.getMainLooper());
     }
@@ -69,7 +67,7 @@ public class TerminalService {
 
             if (rootfsEmpty || !bootMarker.exists()) {
                 firstBoot = true;
-                notifyProgress(3, "Checking required tools... (فحص الأدوات المطلوبة)");
+                notifyProgress(3, "Checking required tools...");
                 doDownloadBinariesThenInstall();
             } else {
                 firstBoot = false;
@@ -79,243 +77,175 @@ public class TerminalService {
         });
     }
 
-    // -----------------------------------------------------------------------
-    // تحميل proot و busybox إذا لم يكونا موجودَين
-    // -----------------------------------------------------------------------
     private void doDownloadBinariesThenInstall() {
-        File filesDir   = context.getFilesDir();
-        File prootFile  = new File(filesDir, "proot");
+        File filesDir    = context.getFilesDir();
+        File prootFile   = new File(filesDir, "proot");
         File busyboxFile = new File(filesDir, "busybox");
 
         try {
-            // --- proot ---
             if (!prootFile.exists() || prootFile.length() < 100_000) {
-                notifyProgress(8, "Downloading proot... (تحميل proot)");
-                downloadFile(PROOT_URL, prootFile, 8, 20);
+                notifyProgress(8, "Downloading proot...");
+                downloadFile(PROOT_URL, prootFile, 8, 25);
                 prootFile.setExecutable(true);
-                Log.d(TAG, "proot downloaded: " + prootFile.length() + " bytes");
             }
 
-            // --- busybox ---
+            if (!prootFile.exists() || prootFile.length() < 100_000) {
+                notifyError("Download Failed", "proot binary missing or corrupt.");
+                return;
+            }
+
             if (!busyboxFile.exists() || busyboxFile.length() < 100_000) {
-                notifyProgress(22, "Downloading busybox... (تحميل busybox)");
-                downloadFile(BUSYBOX_URL, busyboxFile, 22, 35);
+                notifyProgress(28, "Downloading busybox...");
+                File apkFile = new File(filesDir, "busybox.apk");
+                downloadFile(BUSYBOX_URL, apkFile, 28, 42);
+                extractBusyboxFromApk(apkFile, busyboxFile);
+                apkFile.delete();
                 busyboxFile.setExecutable(true);
-                Log.d(TAG, "busybox downloaded: " + busyboxFile.length() + " bytes");
+            }
+
+            if (!busyboxFile.exists() || busyboxFile.length() < 100_000) {
+                notifyError("Download Failed", "busybox binary missing or corrupt.");
+                return;
             }
 
         } catch (Exception e) {
             Log.e(TAG, "Binary download failed", e);
-            notifyError(
-                "Download Failed (فشل التحميل)",
-                "Could not download proot/busybox. Check internet connection.\n" + e.getMessage()
-            );
+            notifyError("Download Failed", "Check internet connection.\n" + e.getMessage());
             return;
         }
 
-        // تحقق أن الملفات سليمة بعد التحميل
-        if (!prootFile.exists() || prootFile.length() < 100_000) {
-            notifyError("proot invalid", "Downloaded file is too small or corrupt.");
-            return;
-        }
-        if (!busyboxFile.exists() || busyboxFile.length() < 100_000) {
-            notifyError("busybox invalid", "Downloaded file is too small or corrupt.");
-            return;
-        }
-
-        // بعد التحميل نكمل التثبيت
         doExtractAndInstall();
     }
 
-    /**
-     * تحميل ملف من URL مع تتبع التقدم بين startPct و endPct
-     */
-    private void downloadFile(String urlStr, File outFile, int startPct, int endPct)
-            throws Exception {
+    private void extractBusyboxFromApk(File apkFile, File outFile) throws Exception {
+        java.util.zip.ZipFile zip = new java.util.zip.ZipFile(apkFile);
+        java.util.zip.ZipEntry entry = zip.getEntry("bin/busybox");
+        if (entry == null) entry = zip.getEntry("usr/bin/busybox");
+        if (entry == null) {
+            zip.close();
+            throw new Exception("busybox entry not found inside APK");
+        }
+        InputStream in  = zip.getInputStream(entry);
+        FileOutputStream fos = new FileOutputStream(outFile);
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) != -1) fos.write(buf, 0, n);
+        fos.close();
+        in.close();
+        zip.close();
+    }
 
-        // حذف ملف قديم ناقص إن وُجد
+    private void downloadFile(String urlStr, File outFile, int startPct, int endPct) throws Exception {
         if (outFile.exists()) outFile.delete();
-
         URL url = new URL(urlStr);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setConnectTimeout(15_000);
-        conn.setReadTimeout(60_000);
-        conn.setRequestProperty("User-Agent", "DevPocket/1.0 Android");
+        conn.setInstanceFollowRedirects(true);
+        conn.setConnectTimeout(20_000);
+        conn.setReadTimeout(120_000);
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0");
         conn.connect();
 
-        int responseCode = conn.getResponseCode();
-        if (responseCode != HttpURLConnection.HTTP_OK) {
-            throw new Exception("HTTP " + responseCode + " for " + urlStr);
+        if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) {
+            conn.disconnect();
+            throw new Exception("HTTP " + conn.getResponseCode());
         }
 
-        long totalBytes = conn.getContentLengthLong();
-        long downloaded = 0;
-
+        long total = conn.getContentLengthLong();
+        long done  = 0;
         InputStream in  = conn.getInputStream();
         FileOutputStream fos = new FileOutputStream(outFile);
-        byte[] buffer = new byte[8192];
+        byte[] buf = new byte[8192];
         int n;
-
-        while ((n = in.read(buffer)) != -1) {
-            fos.write(buffer, 0, n);
-            downloaded += n;
-
-            // تحديث شريط التقدم
-            if (totalBytes > 0) {
-                int pct = startPct + (int) ((downloaded * (endPct - startPct)) / totalBytes);
+        while ((n = in.read(buf)) != -1) {
+            fos.write(buf, 0, n);
+            done += n;
+            if (total > 0) {
+                int pct = startPct + (int)((done * (endPct - startPct)) / total);
                 notifyProgress(Math.min(pct, endPct), null);
             }
         }
-
-        fos.flush();
-        fos.close();
-        in.close();
-        conn.disconnect();
+        fos.flush(); fos.close();
+        in.close(); conn.disconnect();
     }
 
-    // -----------------------------------------------------------------------
-    // تثبيت Alpine عبر proot
-    // -----------------------------------------------------------------------
     private void doExtractAndInstall() {
         try {
             File filesDir  = context.getFilesDir();
             File rootfsDir = new File(filesDir, ROOTFS_DIR);
             if (!rootfsDir.exists()) rootfsDir.mkdirs();
 
-            String rootfsPath = rootfsDir.getAbsolutePath();
-            String prootPath  = new File(filesDir, "proot").getAbsolutePath();
+            String prootPath = new File(filesDir, "proot").getAbsolutePath();
+            File prootTmp = new File(filesDir, "proot-tmp");
+            if (!prootTmp.exists()) prootTmp.mkdirs();
 
-            notifyProgress(38, "Updating package manager... (تحديث مدير الحزم)");
-            boolean ok = runInProot(prootPath, rootfsPath, "apk update --no-cache");
-            if (!ok) { notifyError("apk update failed", "Check network connectivity"); return; }
+            notifyProgress(46, "Updating package manager...");
+            boolean ok = runInProot(prootPath, rootfsDir.getAbsolutePath(), prootTmp.getAbsolutePath(), "apk update --no-cache");
+            
+            if (ok) {
+                notifyProgress(60, "Installing environment...");
+                ok = runInProot(prootPath, rootfsDir.getAbsolutePath(), prootTmp.getAbsolutePath(), "apk add --no-cache nodejs npm git");
+            }
+            
+            if (ok) {
+                notifyProgress(78, "Installing components...");
+                ok = runInProot(prootPath, rootfsDir.getAbsolutePath(), prootTmp.getAbsolutePath(), "npm install -g opencode-ai@latest");
+            }
 
-            notifyProgress(55, "Installing Node.js & npm... (تثبيت النود)");
-            ok = runInProot(prootPath, rootfsPath, "apk add --no-cache nodejs npm git");
-            if (!ok) { notifyError("apk add failed", "Could not install nodejs/npm"); return; }
-
-            notifyProgress(75, "Installing opencode-ai... (تثبيت أوبن كود)");
-            ok = runInProot(prootPath, rootfsPath, "npm install -g opencode-ai@latest");
-            if (!ok) { notifyError("npm install failed", "Could not install opencode-ai"); return; }
-
-            // كتابة علامة اكتمال التثبيت فقط بعد النجاح الفعلي
-            new File(rootfsDir, BOOT_MARKER).createNewFile();
-            firstBoot = false;
-
-            notifyProgress(90, "Setup complete! Starting server... (اكتمل التثبيت)");
-            doStartShell();
-
+            if (ok) {
+                new File(rootfsDir, BOOT_MARKER).createNewFile();
+                firstBoot = false;
+                notifyProgress(90, "Setup complete!");
+                doStartShell();
+            } else {
+                notifyError("Setup Failed", "Installation step failed.");
+            }
         } catch (Exception e) {
-            Log.e(TAG, "Install failed", e);
-            notifyError("Setup Failed", "Could not initialize environment: " + e.getMessage());
+            notifyError("Setup Failed", e.getMessage());
         }
     }
 
-    private boolean runInProot(String prootPath, String rootfsPath, String cmd) {
+    private boolean runInProot(String prootPath, String rootfsPath, String prootTmpDir, String cmd) {
         try {
-            ProcessBuilder pb = new ProcessBuilder(
-                prootPath,
-                "-r", rootfsPath,
-                "-b", "/dev",
-                "-b", "/proc",
-                "-b", "/sys",
-                "-w", "/root",
-                "/bin/sh", "-c", cmd
-            );
+            ProcessBuilder pb = new ProcessBuilder(prootPath, "-r", rootfsPath, "-b", "/dev", "-b", "/proc", "-b", "/sys", "-w", "/root", "/bin/sh", "-c", cmd);
             pb.environment().put("HOME", "/root");
             pb.environment().put("TERM", "xterm-256color");
             pb.environment().put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-            pb.environment().put("LD_PRELOAD", "");
+            pb.environment().put("PROOT_TMP_DIR", prootTmpDir);
             pb.redirectErrorStream(true);
-
             Process proc = pb.start();
-            BufferedReader reader = new BufferedReader(
-                new InputStreamReader(proc.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                final String l = line;
-                if (bridge != null) bridge.onTerminalData(l + "\r\n");
-            }
-
-            int exitCode = proc.waitFor();
-            Log.d(TAG, "Command [" + cmd + "] exit=" + exitCode);
-            return exitCode == 0;
-
-        } catch (Exception e) {
-            Log.e(TAG, "runInProot error: " + e.getMessage());
-            return false;
-        }
+            return proc.waitFor() == 0;
+        } catch (Exception e) { return false; }
     }
 
-    // -----------------------------------------------------------------------
-    // تشغيل الـ shell
-    // -----------------------------------------------------------------------
     private void doStartShell() {
         try {
             File filesDir  = context.getFilesDir();
             File rootfsDir = new File(filesDir, ROOTFS_DIR);
             File prootFile = new File(filesDir, "proot");
-
-            ProcessBuilder pb;
-            if (prootFile.exists()) {
-                pb = new ProcessBuilder(
-                    prootFile.getAbsolutePath(),
-                    "-r", rootfsDir.getAbsolutePath(),
-                    "-b", "/dev",
-                    "-b", "/proc",
-                    "-b", "/sys",
-                    "-w", "/root",
-                    "/bin/sh"
-                );
-            } else {
-                pb = new ProcessBuilder("/system/bin/sh");
-            }
-
+            File prootTmp  = new File(filesDir, "proot-tmp");
+            
+            ProcessBuilder pb = new ProcessBuilder(prootFile.getAbsolutePath(), "-r", rootfsDir.getAbsolutePath(), "-b", "/dev", "-b", "/proc", "-b", "/sys", "-w", "/root", "/bin/sh");
             pb.environment().put("HOME", "/root");
             pb.environment().put("TERM", "xterm-256color");
-            pb.environment().put("SHELL", "/bin/sh");
-            pb.environment().put("USER", "root");
-            pb.environment().put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-            pb.environment().put("LD_PRELOAD", "");
-            pb.directory(rootfsDir.exists() ? rootfsDir : filesDir);
-
+            pb.environment().put("PROOT_TMP_DIR", prootTmp.getAbsolutePath());
+            
             shellProcess = pb.start();
             shellInput   = shellProcess.getOutputStream();
             isRunning.set(true);
-
-            startOutputReader(new BufferedReader(
-                new InputStreamReader(shellProcess.getInputStream())));
-            startOutputReader(new BufferedReader(
-                new InputStreamReader(shellProcess.getErrorStream())));
-
-            notifyProgress(95, "Launching OpenCode Engine... (بدء تشغيل المحرك)");
+            startOutputReader(new BufferedReader(new InputStreamReader(shellProcess.getInputStream())));
             writeDirectly("opencode serve\n");
-
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to start shell", e);
-            notifyError("Shell Error", "Could not start terminal: " + e.getMessage());
-        }
+        } catch (Exception e) { notifyError("Shell Error", e.getMessage()); }
     }
 
     private void startOutputReader(final BufferedReader reader) {
-        Thread t = new Thread(() -> {
+        new Thread(() -> {
             try {
-                char[] buf = new char[4096];
-                int n;
-                while (isRunning.get() && (n = reader.read(buf, 0, buf.length)) != -1) {
-                    String chunk = new String(buf, 0, n);
-                    if (bridge != null) {
-                        bridge.onTerminalData(chunk);
-                        if (chunk.contains("http://127.0.0.1:4096")) {
-                            bridge.onReady();
-                        }
-                    }
+                String line;
+                while (isRunning.get() && (line = reader.readLine()) != null) {
+                    if (bridge != null) bridge.onTerminalData(line + "\r\n");
                 }
-            } catch (Exception e) {
-                Log.e(TAG, "Output reader error: " + e.getMessage());
-            }
-        });
-        t.setDaemon(true);
-        t.start();
+            } catch (Exception ignored) {}
+        }).start();
     }
 
     private void writeDirectly(String data) {
@@ -324,28 +254,14 @@ public class TerminalService {
                 shellInput.write(data.getBytes("UTF-8"));
                 shellInput.flush();
             }
-        } catch (Exception e) {
-            Log.e(TAG, "writeDirectly error: " + e.getMessage());
-        }
-    }
-
-    public void write(String command) {
-        writeExecutor.submit(() -> writeDirectly(command));
+        } catch (Exception ignored) {}
     }
 
     public void stop() {
         isRunning.set(false);
-        writeExecutor.submit(() -> {
-            writeDirectly("exit\n");
-            try { if (shellProcess != null) shellProcess.destroy(); } catch (Exception ignored) {}
-        });
+        try { if (shellProcess != null) shellProcess.destroy(); } catch (Exception ignored) {}
     }
 
-    private void notifyProgress(int percent, String message) {
-        if (bridge != null) bridge.onInstallProgress(percent, message);
-    }
-
-    private void notifyError(String title, String details) {
-        if (bridge != null) bridge.onError(title, details);
-    }
+    private void notifyProgress(int p, String m) { if (bridge != null) bridge.onInstallProgress(p, m); }
+    private void notifyError(String t, String d) { if (bridge != null) bridge.onError(t, d); }
 }
