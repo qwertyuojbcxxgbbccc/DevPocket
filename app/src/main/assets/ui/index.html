@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0D1117">
+<title>OpenCode Mobile</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="boot-layer">
+  <div id="branding-icon">
+    <svg width="90" height="90" viewBox="0 0 24 24" fill="none" stroke="url(#grad1)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <defs>
+        <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#667eea"/>
+          <stop offset="100%" stop-color="#764ba2"/>
+        </linearGradient>
+      </defs>
+      <polyline points="4 17 10 11 4 5"></polyline>
+      <line x1="12" y1="19" x2="20" y2="19"></line>
+    </svg>
+  </div>
+  <div id="progress-wrapper">
+    <div id="progress-track">
+      <div id="progress-fill"></div>
+    </div>
+    <div id="status-label">Initializing... (جاري التهيئة)</div>
+  </div>
+  <button id="action-btn" disabled>OpenCode</button>
+</div>
+
+<div id="server-layer" style="display:none;">
+  <iframe id="server-frame"></iframe>
+  <button id="fab-close">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="18" y1="6" x2="6" y2="18"></line>
+      <line x1="6" y1="6" x2="18" y2="18"></line>
+    </svg>
+  </button>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>

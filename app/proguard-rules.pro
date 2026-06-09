@@ -1,0 +1,8 @@
+-keep class com.opencode.mobile.WebAppInterface { *; }
+-keepclassmembers class com.opencode.mobile.WebAppInterface { @android.webkit.JavascriptInterface <methods>; }
+-keepattributes JavascriptInterface
+-keepattributes *Annotation*
+-dontwarn javax.annotation.**
+-dontwarn kotlin.Unit
+-dontwarn retrofit2.KotlinExtensions
+-dontwarn retrofit2.KotlinExtensions$*
