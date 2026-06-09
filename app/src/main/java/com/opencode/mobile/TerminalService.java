@@ -51,8 +51,9 @@ public class TerminalService {
         this.bridge = bridge;
     }
 
-    public boolean isFirstBoot() {
-        return firstBoot;
+    // ✅ تمت إضافة الدالة التي كان يفتقدها الـ WebAppInterface
+    public void write(String command) {
+        writeExecutor.submit(() -> writeDirectly(command));
     }
 
     public void checkInstallStatus() {
@@ -110,7 +111,7 @@ public class TerminalService {
 
         } catch (Exception e) {
             Log.e(TAG, "Binary download failed", e);
-            notifyError("Download Failed", "Check internet connection.\n" + e.getMessage());
+            notifyError("Download Failed", "Check internet connection.");
             return;
         }
 
