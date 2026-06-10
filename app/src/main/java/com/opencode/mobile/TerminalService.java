@@ -205,6 +205,7 @@ public class TerminalService {
         byte[] header = new byte[512];
         int fileCount = 0;
         String pendingLongName = null; // GNU LongLink
+        java.util.Map<String, String> pendingSymlinks = new java.util.LinkedHashMap<>();
 
         while (true) {
             // قراءة header block
@@ -265,21 +266,36 @@ public class TerminalService {
                 skipEntry(tarStream, size);
 
             } else if (type == '2') {
-                // Symlink — Android يدعمها
+                // Symlink
                 if (outFile.exists()) outFile.delete();
                 outFile.getParentFile().mkdirs();
+                boolean symlinkOk = false;
                 try {
                     java.nio.file.Files.createSymbolicLink(
                         outFile.toPath(),
                         java.nio.file.Paths.get(linkName)
                     );
+                    symlinkOk = true;
+                    Log.d(TAG, "Symlink: " + name + " -> " + linkName);
                 } catch (Exception e) {
-                    Log.w(TAG, "Symlink skip: " + name + " -> " + linkName);
+                    Log.w(TAG, "Symlink failed, will resolve later: " + name + " -> " + linkName);
+                }
+                // إذا فشل symlink: حفظ الزوج للحل لاحقاً
+                if (!symlinkOk) {
+                    pendingSymlinks.put(name, linkName);
                 }
                 skipEntry(tarStream, size);
 
             } else if (type == '1') {
-                // Hard link — تخطي (نادر في Alpine minirootfs)
+                // Hard link — نسخ الملف المصدر
+                outFile.getParentFile().mkdirs();
+                File linkSrc = new File(destDir, linkName.startsWith("./") ? linkName.substring(2) : linkName);
+                if (linkSrc.exists() && !linkSrc.isDirectory()) {
+                    copyFileSimple(linkSrc, outFile);
+                    Log.d(TAG, "HardLink copied: " + name + " <- " + linkName);
+                } else {
+                    pendingSymlinks.put(name, linkName);
+                }
                 skipEntry(tarStream, size);
 
             } else {
@@ -304,7 +320,55 @@ public class TerminalService {
             }
         }
         Log.d(TAG, "tar: extracted " + fileCount + " files");
-        if (bridge != null) bridge.onTerminalData("Extracted " + fileCount + " files OK\r\n");
+
+        // حل الـ symlinks المعلقة — بعد اكتمال الاستخراج
+        int resolvedCount = 0;
+        for (java.util.Map.Entry<String, String> entry : pendingSymlinks.entrySet()) {
+            String symName = entry.getKey();
+            String symTarget = entry.getValue();
+            File symFile = new File(destDir, symName);
+            symFile.getParentFile().mkdirs();
+            if (symFile.exists()) symFile.delete();
+
+            // محاولة symlink مرة أخرى
+            try {
+                java.nio.file.Files.createSymbolicLink(
+                    symFile.toPath(),
+                    java.nio.file.Paths.get(symTarget)
+                );
+                resolvedCount++;
+                continue;
+            } catch (Exception ignored) {}
+
+            // fallback: نسخ الملف الحقيقي مباشرة
+            String cleanTarget = symTarget.startsWith("/") ? symTarget.substring(1) : symTarget;
+            if (cleanTarget.startsWith("./")) cleanTarget = cleanTarget.substring(2);
+            File srcFile = new File(destDir, cleanTarget);
+            if (srcFile.exists() && !srcFile.isDirectory()) {
+                try {
+                    copyFileSimple(srcFile, symFile);
+                    resolvedCount++;
+                    Log.d(TAG, "Symlink fallback copy: " + symName + " <- " + cleanTarget);
+                } catch (Exception e2) {
+                    Log.w(TAG, "Could not resolve symlink: " + symName + " -> " + symTarget);
+                }
+            } else {
+                Log.w(TAG, "Symlink target missing: " + symName + " -> " + symTarget + " (src=" + srcFile.getAbsolutePath() + ")");
+            }
+        }
+
+        Log.d(TAG, "tar: extracted=" + fileCount + " symlinks_resolved=" + resolvedCount + "/" + pendingSymlinks.size());
+        if (bridge != null) bridge.onTerminalData("Extracted " + fileCount + " files, " + resolvedCount + " symlinks OK\r\n");
+    }
+
+    private void copyFileSimple(File src, File dst) throws Exception {
+        if (dst.exists()) dst.delete();
+        try (FileInputStream fis = new FileInputStream(src);
+             FileOutputStream fos = new FileOutputStream(dst)) {
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = fis.read(buf)) != -1) fos.write(buf, 0, n);
+        }
     }
 
     // ── tar helpers ─────────────────────────────────────────────────────────
