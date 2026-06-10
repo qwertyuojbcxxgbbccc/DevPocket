@@ -23,22 +23,24 @@ public class TerminalService {
     private static final String ROOTFS_DIR  = "usr";
     private static final String BOOT_MARKER = ".boot_complete";
 
-    // ✅ proot — روابط مجربة مع fallback
+    // ✅ proot — روابط مع fallback
     private static final String[] PROOT_URLS = {
-        // GitHub Pages ثابت لا يتغير
         "https://skirsten.github.io/proot-portable-android-binaries/aarch64/proot",
-        // jsDelivr CDN من نفس المصدر
         "https://cdn.jsdelivr.net/gh/skirsten/proot-portable-android-binaries@latest/aarch64/proot"
     };
 
-    // ✅ busybox — binary مباشر مخصص لـ Android (بدون APK)
+    // ✅ busybox — binary مباشر لـ Android بدون APK
     private static final String[] BUSYBOX_URLS = {
-        // EXALAB — مُجمَّع خصيصاً لأجهزة Android
         "https://raw.githubusercontent.com/EXALAB/Busybox-static/main/busybox_arm64",
-        // xerta555 — نسخة بديلة arm64
         "https://raw.githubusercontent.com/xerta555/Busybox-Binaries/master/busybox-arm64",
-        // shutingrz — busybox 1.36.0 aarch64 static
         "https://raw.githubusercontent.com/shutingrz/busybox-static-binaries-fat/main/busybox-aarch64-linux-gnu"
+    };
+
+    // ✅ Alpine Linux minirootfs aarch64 — المشكلة الأساسية: rootfs لم يكن يُحمَّل أبداً!
+    private static final String[] ALPINE_ROOTFS_URLS = {
+        "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.7-aarch64.tar.gz",
+        "https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/aarch64/alpine-minirootfs-3.18.9-aarch64.tar.gz",
+        "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.3-aarch64.tar.gz"
     };
 
     private final Context context;
@@ -93,7 +95,7 @@ public class TerminalService {
     }
 
     // -----------------------------------------------------------------------
-    // تحميل proot و busybox — binary مباشر بدون APK
+    // المرحلة 1: تحميل proot و busybox و Alpine rootfs
     // -----------------------------------------------------------------------
     private void doDownloadBinariesThenInstall() {
         File filesDir    = context.getFilesDir();
@@ -103,52 +105,209 @@ public class TerminalService {
         try {
             // --- proot ---
             if (!prootFile.exists() || prootFile.length() < 100_000) {
-                notifyProgress(8, "Downloading proot... (تحميل proot)");
-                boolean ok = downloadFileWithFallback(PROOT_URLS, prootFile, 8, 28);
+                notifyProgress(5, "Downloading proot... (تحميل proot)");
+                boolean ok = downloadFileWithFallback(PROOT_URLS, prootFile, 5, 18);
                 if (ok) {
                     prootFile.setExecutable(true);
                     Log.d(TAG, "proot OK: " + prootFile.length() + " bytes");
                 }
             }
-
             if (!prootFile.exists() || prootFile.length() < 100_000) {
                 notifyError("proot download failed",
-                    "All sources failed. Check internet connection.\nTried:\n"
-                    + String.join("\n", PROOT_URLS));
+                    "All sources failed.\nTried:\n" + String.join("\n", PROOT_URLS));
                 return;
             }
 
-            // --- busybox: binary مباشر بدون APK ---
+            // --- busybox: binary مباشر ---
             if (!busyboxFile.exists() || busyboxFile.length() < 100_000) {
-                notifyProgress(30, "Downloading busybox... (تحميل busybox)");
-                boolean ok = downloadFileWithFallback(BUSYBOX_URLS, busyboxFile, 30, 46);
+                notifyProgress(20, "Downloading busybox... (تحميل busybox)");
+                boolean ok = downloadFileWithFallback(BUSYBOX_URLS, busyboxFile, 20, 32);
                 if (ok) {
                     busyboxFile.setExecutable(true);
                     Log.d(TAG, "busybox OK: " + busyboxFile.length() + " bytes");
                 }
             }
-
             if (!busyboxFile.exists() || busyboxFile.length() < 100_000) {
                 notifyError("busybox download failed",
-                    "All sources failed. Check internet connection.\nTried:\n"
-                    + String.join("\n", BUSYBOX_URLS));
+                    "All sources failed.\nTried:\n" + String.join("\n", BUSYBOX_URLS));
                 return;
             }
 
         } catch (Exception e) {
             Log.e(TAG, "Binary download failed", e);
-            notifyError(
-                "Download Failed (فشل التحميل)",
-                "Check internet connection.\n" + e.getMessage()
-            );
+            notifyError("Download Failed (فشل التحميل)", e.getMessage());
             return;
         }
 
-        doExtractAndInstall();
+        doDownloadAndExtractRootfs();
     }
 
     // -----------------------------------------------------------------------
-    // تحميل مع fallback — يجرّب كل رابط بالترتيب
+    // المرحلة 2: تحميل Alpine minirootfs وفكّه — هذا كان مفقوداً تماماً!
+    // -----------------------------------------------------------------------
+    private void doDownloadAndExtractRootfs() {
+        File filesDir  = context.getFilesDir();
+        File rootfsDir = new File(filesDir, ROOTFS_DIR);
+
+        // التحقق: هل Alpine موجودة مسبقاً (bin/sh)؟
+        File binSh = new File(rootfsDir, "bin/sh");
+        if (binSh.exists()) {
+            Log.d(TAG, "Alpine rootfs already extracted, skipping download");
+            doInstallPackages();
+            return;
+        }
+
+        File tarFile = new File(filesDir, "alpine-rootfs.tar.gz");
+        try {
+            notifyProgress(33, "Downloading Alpine Linux... (تحميل Alpine)");
+            boolean ok = downloadFileWithFallback(ALPINE_ROOTFS_URLS, tarFile, 33, 52);
+            if (!ok || !tarFile.exists() || tarFile.length() < 500_000) {
+                notifyError("Alpine download failed",
+                    "Could not download Alpine rootfs.\nTried:\n"
+                    + String.join("\n", ALPINE_ROOTFS_URLS));
+                return;
+            }
+            Log.d(TAG, "Alpine tar OK: " + tarFile.length() + " bytes");
+
+            // إنشاء rootfsDir
+            if (!rootfsDir.exists()) rootfsDir.mkdirs();
+
+            notifyProgress(54, "Extracting Alpine Linux... (فك ضغط Alpine)");
+            extractTarGz(tarFile, rootfsDir);
+            tarFile.delete();
+
+            // التحقق من نجاح الاستخراج
+            if (!binSh.exists()) {
+                notifyError("Extract failed",
+                    "Alpine extraction incomplete — /bin/sh not found in rootfs.");
+                return;
+            }
+            Log.d(TAG, "Alpine extracted OK");
+
+        } catch (Exception e) {
+            Log.e(TAG, "Rootfs setup failed", e);
+            if (tarFile.exists()) tarFile.delete();
+            notifyError("Alpine Setup Failed", e.getMessage());
+            return;
+        }
+
+        doInstallPackages();
+    }
+
+    // -----------------------------------------------------------------------
+    // فك ضغط tar.gz باستخدام busybox
+    // -----------------------------------------------------------------------
+    private void extractTarGz(File tarFile, File destDir) throws Exception {
+        File busyboxFile = new File(context.getFilesDir(), "busybox");
+
+        // استخدم busybox tar لفك الضغط
+        ProcessBuilder pb = new ProcessBuilder(
+            busyboxFile.getAbsolutePath(),
+            "tar", "-xzf", tarFile.getAbsolutePath(),
+            "-C", destDir.getAbsolutePath()
+        );
+        pb.environment().put("HOME", "/tmp");
+        pb.environment().put("TMPDIR", context.getCacheDir().getAbsolutePath());
+        pb.redirectErrorStream(true);
+
+        Process proc = pb.start();
+        BufferedReader reader = new BufferedReader(
+            new InputStreamReader(proc.getInputStream()));
+        StringBuilder output = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            output.append(line).append("\n");
+            if (bridge != null) bridge.onTerminalData(line + "\r\n");
+        }
+        int exit = proc.waitFor();
+        Log.d(TAG, "tar exit=" + exit + " output=" + output.toString().substring(
+            0, Math.min(200, output.length())));
+
+        if (exit != 0) {
+            throw new Exception("tar extraction failed (exit=" + exit + ")\n" + output);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // المرحلة 3: تثبيت الحزم داخل Alpine
+    // -----------------------------------------------------------------------
+    private void doInstallPackages() {
+        try {
+            File filesDir  = context.getFilesDir();
+            File rootfsDir = new File(filesDir, ROOTFS_DIR);
+            String rootfsPath = rootfsDir.getAbsolutePath();
+            String prootPath  = new File(filesDir, "proot").getAbsolutePath();
+
+            File prootTmp = new File(filesDir, "proot-tmp");
+            if (!prootTmp.exists()) prootTmp.mkdirs();
+            String prootTmpPath = prootTmp.getAbsolutePath();
+
+            // إعداد /etc/resolv.conf للشبكة داخل proot
+            setupResolvConf(rootfsDir);
+
+            notifyProgress(58, "Updating package list... (تحديث قائمة الحزم)");
+            boolean ok = runInProot(prootPath, rootfsPath, prootTmpPath,
+                "apk update --no-cache");
+            if (!ok) {
+                // محاولة ثانية بعد إصلاح DNS
+                Log.w(TAG, "apk update failed, retrying after DNS fix...");
+                setupResolvConf(rootfsDir);
+                ok = runInProot(prootPath, rootfsPath, prootTmpPath,
+                    "apk update --no-cache");
+            }
+            if (!ok) {
+                notifyError("apk update failed",
+                    "Could not reach Alpine package servers.\nCheck internet connection.");
+                return;
+            }
+
+            notifyProgress(68, "Installing Node.js & npm... (تثبيت Node.js)");
+            ok = runInProot(prootPath, rootfsPath, prootTmpPath,
+                "apk add --no-cache nodejs npm git");
+            if (!ok) {
+                notifyError("apk add failed", "Could not install nodejs/npm");
+                return;
+            }
+
+            notifyProgress(82, "Installing opencode-ai... (تثبيت opencode)");
+            ok = runInProot(prootPath, rootfsPath, prootTmpPath,
+                "npm install -g opencode-ai@latest");
+            if (!ok) {
+                notifyError("npm install failed", "Could not install opencode-ai");
+                return;
+            }
+
+            new File(rootfsDir, BOOT_MARKER).createNewFile();
+            firstBoot = false;
+
+            notifyProgress(92, "Setup complete! Starting... (اكتمل التثبيت)");
+            doStartShell();
+
+        } catch (Exception e) {
+            Log.e(TAG, "Install packages failed", e);
+            notifyError("Setup Failed", e.getMessage());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // إعداد DNS داخل rootfs حتى تعمل الشبكة داخل proot
+    // -----------------------------------------------------------------------
+    private void setupResolvConf(File rootfsDir) {
+        try {
+            File etcDir = new File(rootfsDir, "etc");
+            if (!etcDir.exists()) etcDir.mkdirs();
+            File resolv = new File(etcDir, "resolv.conf");
+            FileOutputStream fos = new FileOutputStream(resolv);
+            fos.write("nameserver 8.8.8.8\nnameserver 1.1.1.1\n".getBytes("UTF-8"));
+            fos.close();
+            Log.d(TAG, "resolv.conf written");
+        } catch (Exception e) {
+            Log.w(TAG, "Could not write resolv.conf: " + e.getMessage());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // تحميل مع fallback
     // -----------------------------------------------------------------------
     private boolean downloadFileWithFallback(String[] urls, File outFile,
                                               int startPct, int endPct) {
@@ -156,25 +315,21 @@ public class TerminalService {
             String url = urls[i];
             try {
                 notifyProgress(startPct,
-                    "Trying source " + (i + 1) + "/" + urls.length + "...");
+                    "Source " + (i + 1) + "/" + urls.length + "...");
                 Log.d(TAG, "Downloading: " + url);
                 downloadFile(url, outFile, startPct, endPct);
-                if (outFile.exists() && outFile.length() > 100_000) {
-                    Log.d(TAG, "✅ OK from: " + url + " [" + outFile.length() + " bytes]");
+                if (outFile.exists() && outFile.length() > 10_000) {
+                    Log.d(TAG, "✅ OK: " + url + " [" + outFile.length() + "b]");
                     return true;
-                } else {
-                    Log.w(TAG, "⚠️ Too small from: " + url
-                        + " [" + outFile.length() + " bytes]");
                 }
             } catch (Exception e) {
-                Log.w(TAG, "❌ Failed [" + url + "]: " + e.getMessage());
+                Log.w(TAG, "❌ [" + url + "]: " + e.getMessage());
             }
-            if (outFile.exists()) outFile.delete(); // cleanup قبل المحاولة التالية
+            if (outFile.exists()) outFile.delete();
         }
         return false;
     }
 
-    // -----------------------------------------------------------------------
     private void downloadFile(String urlStr, File outFile, int startPct, int endPct)
             throws Exception {
         if (outFile.exists()) outFile.delete();
@@ -182,8 +337,8 @@ public class TerminalService {
         URL url = new URL(urlStr);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setInstanceFollowRedirects(true);
-        conn.setConnectTimeout(20_000);
-        conn.setReadTimeout(120_000);
+        conn.setConnectTimeout(30_000);
+        conn.setReadTimeout(180_000);
         conn.setRequestProperty("User-Agent", "DevPocket/1.0 Android");
         conn.connect();
 
@@ -195,10 +350,9 @@ public class TerminalService {
 
         long total = conn.getContentLengthLong();
         long done  = 0;
-
         InputStream in  = conn.getInputStream();
         FileOutputStream fos = new FileOutputStream(outFile);
-        byte[] buf = new byte[8192];
+        byte[] buf = new byte[16384];
         int n;
         while ((n = in.read(buf)) != -1) {
             fos.write(buf, 0, n);
@@ -208,68 +362,17 @@ public class TerminalService {
                 notifyProgress(Math.min(pct, endPct), null);
             }
         }
-        fos.flush();
-        fos.close();
-        in.close();
-        conn.disconnect();
+        fos.flush(); fos.close();
+        in.close(); conn.disconnect();
     }
 
     // -----------------------------------------------------------------------
-    // تثبيت Alpine
-    // -----------------------------------------------------------------------
-    private void doExtractAndInstall() {
-        try {
-            File filesDir  = context.getFilesDir();
-            File rootfsDir = new File(filesDir, ROOTFS_DIR);
-            if (!rootfsDir.exists()) rootfsDir.mkdirs();
-
-            String rootfsPath = rootfsDir.getAbsolutePath();
-            String prootPath  = new File(filesDir, "proot").getAbsolutePath();
-
-            File prootTmp = new File(filesDir, "proot-tmp");
-            if (!prootTmp.exists()) prootTmp.mkdirs();
-
-            notifyProgress(48, "Updating package manager... (تحديث مدير الحزم)");
-            boolean ok = runInProot(prootPath, rootfsPath, prootTmp.getAbsolutePath(),
-                "apk update --no-cache");
-            if (!ok) {
-                notifyError("apk update failed", "Check network connectivity");
-                return;
-            }
-
-            notifyProgress(62, "Installing Node.js & npm... (تثبيت النود)");
-            ok = runInProot(prootPath, rootfsPath, prootTmp.getAbsolutePath(),
-                "apk add --no-cache nodejs npm git");
-            if (!ok) {
-                notifyError("apk add failed", "Could not install nodejs/npm");
-                return;
-            }
-
-            notifyProgress(78, "Installing opencode-ai... (تثبيت أوبن كود)");
-            ok = runInProot(prootPath, rootfsPath, prootTmp.getAbsolutePath(),
-                "npm install -g opencode-ai@latest");
-            if (!ok) {
-                notifyError("npm install failed", "Could not install opencode-ai");
-                return;
-            }
-
-            new File(rootfsDir, BOOT_MARKER).createNewFile();
-            firstBoot = false;
-
-            notifyProgress(90, "Setup complete! Starting server... (اكتمل التثبيت)");
-            doStartShell();
-
-        } catch (Exception e) {
-            Log.e(TAG, "Install failed", e);
-            notifyError("Setup Failed", e.getMessage());
-        }
-    }
-
     private boolean runInProot(String prootPath, String rootfsPath,
                                String prootTmpDir, String cmd) {
         try {
             ProcessBuilder pb = new ProcessBuilder(
                 prootPath,
+                "--kill-on-exit",
                 "-r", rootfsPath,
                 "-b", "/dev",
                 "-b", "/proc",
@@ -293,10 +396,10 @@ public class TerminalService {
                 if (bridge != null) bridge.onTerminalData(line + "\r\n");
             }
             int exit = proc.waitFor();
-            Log.d(TAG, "[" + cmd + "] exit=" + exit);
+            Log.d(TAG, "[proot] " + cmd + " => exit=" + exit);
             return exit == 0;
         } catch (Exception e) {
-            Log.e(TAG, "runInProot: " + e.getMessage());
+            Log.e(TAG, "runInProot failed: " + e.getMessage());
             return false;
         }
     }
@@ -313,9 +416,10 @@ public class TerminalService {
             if (!prootTmp.exists()) prootTmp.mkdirs();
 
             ProcessBuilder pb;
-            if (prootFile.exists()) {
+            if (prootFile.exists() && rootfsDir.exists()) {
                 pb = new ProcessBuilder(
                     prootFile.getAbsolutePath(),
+                    "--kill-on-exit",
                     "-r", rootfsDir.getAbsolutePath(),
                     "-b", "/dev",
                     "-b", "/proc",
@@ -346,7 +450,7 @@ public class TerminalService {
             startOutputReader(new BufferedReader(
                 new InputStreamReader(shellProcess.getErrorStream())));
 
-            notifyProgress(95, "Launching OpenCode Engine... (بدء تشغيل المحرك)");
+            notifyProgress(96, "Launching OpenCode Engine... (بدء تشغيل المحرك)");
             writeDirectly("opencode serve\n");
 
         } catch (Exception e) {
