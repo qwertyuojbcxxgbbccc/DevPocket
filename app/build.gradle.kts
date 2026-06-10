@@ -14,7 +14,7 @@ android {
         versionName = "1.0.0"
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+            abiFilters += listOf("arm64-v8a")
         }
     }
 
@@ -40,7 +40,16 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    // ✅ تضمين proot وbusybox كـ native libraries قابلة للتنفيذ
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDirs("src/main/jniLibs")
+        }
+    }
+
     packaging {
+        // ✅ منع ضغط الـ .so حتى يُثبَّت قابلاً للتنفيذ مباشرة
+        jniLibs.useLegacyPackaging = true
         resources {
             excludes += setOf(
                 "META-INF/DEPENDENCIES",
