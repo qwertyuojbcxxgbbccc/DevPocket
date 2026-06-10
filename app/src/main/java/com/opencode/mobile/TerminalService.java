@@ -108,7 +108,7 @@ public class TerminalService {
                 notifyProgress(5, "Downloading proot... (تحميل proot)");
                 boolean ok = downloadFileWithFallback(PROOT_URLS, prootFile, 5, 18);
                 if (ok) {
-                    prootFile.setExecutable(true);
+                    chmodExecutable(prootFile);
                     Log.d(TAG, "proot OK: " + prootFile.length() + " bytes");
                 }
             }
@@ -123,7 +123,7 @@ public class TerminalService {
                 notifyProgress(20, "Downloading busybox... (تحميل busybox)");
                 boolean ok = downloadFileWithFallback(BUSYBOX_URLS, busyboxFile, 20, 32);
                 if (ok) {
-                    busyboxFile.setExecutable(true);
+                    chmodExecutable(busyboxFile);
                     Log.d(TAG, "busybox OK: " + busyboxFile.length() + " bytes");
                 }
             }
@@ -307,6 +307,36 @@ public class TerminalService {
     }
 
     // -----------------------------------------------------------------------
+    // منح صلاحية التنفيذ — setExecutable وحدها لا تكفي على Android
+    // -----------------------------------------------------------------------
+    private void chmodExecutable(File file) {
+        // الطريقة 1: Java API
+        file.setExecutable(true, false);
+        file.setReadable(true, false);
+
+        // الطريقة 2: chmod عبر shell — ضرورية على Android
+        try {
+            Process chmod = Runtime.getRuntime().exec(
+                new String[]{"chmod", "755", file.getAbsolutePath()}
+            );
+            chmod.waitFor();
+            Log.d(TAG, "chmod 755 OK: " + file.getAbsolutePath());
+        } catch (Exception e) {
+            Log.w(TAG, "chmod via Runtime failed: " + e.getMessage());
+            // الطريقة 3: /system/bin/chmod كبديل
+            try {
+                Process chmod2 = Runtime.getRuntime().exec(
+                    new String[]{"/system/bin/chmod", "755", file.getAbsolutePath()}
+                );
+                chmod2.waitFor();
+                Log.d(TAG, "chmod via /system/bin OK");
+            } catch (Exception e2) {
+                Log.w(TAG, "chmod via /system/bin failed: " + e2.getMessage());
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // تحميل مع fallback
     // -----------------------------------------------------------------------
     private boolean downloadFileWithFallback(String[] urls, File outFile,
@@ -414,6 +444,11 @@ public class TerminalService {
             File prootFile = new File(filesDir, "proot");
             File prootTmp  = new File(filesDir, "proot-tmp");
             if (!prootTmp.exists()) prootTmp.mkdirs();
+
+            // تأكيد الصلاحيات في كل مرة — قد تُفقد بعد إعادة التشغيل
+            if (prootFile.exists()) chmodExecutable(prootFile);
+            File busyboxFile = new File(filesDir, "busybox");
+            if (busyboxFile.exists()) chmodExecutable(busyboxFile);
 
             ProcessBuilder pb;
             if (prootFile.exists() && rootfsDir.exists()) {
