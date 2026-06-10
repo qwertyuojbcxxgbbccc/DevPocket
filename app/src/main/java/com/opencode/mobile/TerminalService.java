@@ -20,27 +20,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class TerminalService {
 
     private static final String TAG = "TerminalService";
-    private static final String ROOTFS_DIR  = "usr";
+    private static final String ROOTFS_DIR  = "alpine";
     private static final String BOOT_MARKER = ".boot_complete";
 
-    // ✅ proot — روابط مع fallback
-    private static final String[] PROOT_URLS = {
-        "https://skirsten.github.io/proot-portable-android-binaries/aarch64/proot",
-        "https://cdn.jsdelivr.net/gh/skirsten/proot-portable-android-binaries@latest/aarch64/proot"
-    };
-
-    // ✅ busybox — binary مباشر لـ Android بدون APK
-    private static final String[] BUSYBOX_URLS = {
-        "https://raw.githubusercontent.com/EXALAB/Busybox-static/main/busybox_arm64",
-        "https://raw.githubusercontent.com/xerta555/Busybox-Binaries/master/busybox-arm64",
-        "https://raw.githubusercontent.com/shutingrz/busybox-static-binaries-fat/main/busybox-aarch64-linux-gnu"
-    };
-
-    // ✅ Alpine Linux minirootfs aarch64 — المشكلة الأساسية: rootfs لم يكن يُحمَّل أبداً!
+    // ✅ Alpine Linux minirootfs — aarch64
     private static final String[] ALPINE_ROOTFS_URLS = {
         "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.7-aarch64.tar.gz",
-        "https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/aarch64/alpine-minirootfs-3.18.9-aarch64.tar.gz",
-        "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.3-aarch64.tar.gz"
+        "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.3-aarch64.tar.gz",
+        "https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/aarch64/alpine-minirootfs-3.18.9-aarch64.tar.gz"
     };
 
     private final Context context;
@@ -72,120 +59,117 @@ public class TerminalService {
     }
 
     // -----------------------------------------------------------------------
+    // الحصول على مسار proot وbusybox من nativeLibraryDir
+    // هذا هو الحل الحقيقي لـ "Permission denied" على Android 10+
+    // -----------------------------------------------------------------------
+    private File getProotFile() {
+        // nativeLibraryDir: مجلد يسمح Android بتنفيذ الملفات منه
+        String nativeDir = context.getApplicationInfo().nativeLibraryDir;
+        return new File(nativeDir, "libproot.so");
+    }
+
+    private File getBusyboxFile() {
+        String nativeDir = context.getApplicationInfo().nativeLibraryDir;
+        return new File(nativeDir, "libbusybox.so");
+    }
+
+    // -----------------------------------------------------------------------
     public void checkInstallStatus() {
         executor.submit(() -> {
             File rootfsDir  = new File(context.getFilesDir(), ROOTFS_DIR);
             File bootMarker = new File(rootfsDir, BOOT_MARKER);
+            File prootFile  = getProotFile();
+            File busyboxFile = getBusyboxFile();
 
-            boolean rootfsEmpty = !rootfsDir.exists()
-                || !rootfsDir.isDirectory()
-                || rootfsDir.listFiles() == null
-                || rootfsDir.listFiles().length == 0;
+            Log.d(TAG, "proot path: " + prootFile.getAbsolutePath()
+                + " exists=" + prootFile.exists()
+                + " size=" + prootFile.length());
+            Log.d(TAG, "busybox path: " + busyboxFile.getAbsolutePath()
+                + " exists=" + busyboxFile.exists()
+                + " size=" + busyboxFile.length());
 
-            if (rootfsEmpty || !bootMarker.exists()) {
+            boolean rootfsReady = rootfsDir.exists()
+                && rootfsDir.isDirectory()
+                && bootMarker.exists()
+                && new File(rootfsDir, "bin/sh").exists();
+
+            if (!rootfsReady) {
                 firstBoot = true;
-                notifyProgress(3, "Checking required tools... (فحص الأدوات المطلوبة)");
-                doDownloadBinariesThenInstall();
+                notifyProgress(3, "Preparing environment... (تهيئة البيئة)");
+                doSetupRootfs();
             } else {
                 firstBoot = false;
-                notifyProgress(10, "Environment ready. Starting terminal...");
+                notifyProgress(10, "Environment ready. Starting...");
                 doStartShell();
             }
         });
     }
 
     // -----------------------------------------------------------------------
-    // المرحلة 1: تحميل proot و busybox و Alpine rootfs
+    // تحميل Alpine rootfs وفكّه
+    // proot وbusybox مضمّنان في APK ← لا حاجة لتحميلهما
     // -----------------------------------------------------------------------
-    private void doDownloadBinariesThenInstall() {
-        File filesDir    = context.getFilesDir();
-        File prootFile   = new File(filesDir, "proot");
-        File busyboxFile = new File(filesDir, "busybox");
+    private void doSetupRootfs() {
+        File prootFile   = getProotFile();
+        File busyboxFile = getBusyboxFile();
 
-        try {
-            // --- proot ---
-            if (!prootFile.exists() || prootFile.length() < 100_000) {
-                notifyProgress(5, "Downloading proot... (تحميل proot)");
-                boolean ok = downloadFileWithFallback(PROOT_URLS, prootFile, 5, 18);
-                if (ok) {
-                    chmodExecutable(prootFile);
-                    Log.d(TAG, "proot OK: " + prootFile.length() + " bytes");
-                }
-            }
-            if (!prootFile.exists() || prootFile.length() < 100_000) {
-                notifyError("proot download failed",
-                    "All sources failed.\nTried:\n" + String.join("\n", PROOT_URLS));
-                return;
-            }
-
-            // --- busybox: binary مباشر ---
-            if (!busyboxFile.exists() || busyboxFile.length() < 100_000) {
-                notifyProgress(20, "Downloading busybox... (تحميل busybox)");
-                boolean ok = downloadFileWithFallback(BUSYBOX_URLS, busyboxFile, 20, 32);
-                if (ok) {
-                    chmodExecutable(busyboxFile);
-                    Log.d(TAG, "busybox OK: " + busyboxFile.length() + " bytes");
-                }
-            }
-            if (!busyboxFile.exists() || busyboxFile.length() < 100_000) {
-                notifyError("busybox download failed",
-                    "All sources failed.\nTried:\n" + String.join("\n", BUSYBOX_URLS));
-                return;
-            }
-
-        } catch (Exception e) {
-            Log.e(TAG, "Binary download failed", e);
-            notifyError("Download Failed (فشل التحميل)", e.getMessage());
+        // التحقق من وجود الـ binaries في nativeLibraryDir
+        if (!prootFile.exists()) {
+            notifyError("proot not found",
+                "libproot.so missing from nativeLibraryDir.\n"
+                + "Path: " + prootFile.getAbsolutePath()
+                + "\nMake sure jniLibs/arm64-v8a/libproot.so exists in the project.");
+            return;
+        }
+        if (!busyboxFile.exists()) {
+            notifyError("busybox not found",
+                "libbusybox.so missing from nativeLibraryDir.\n"
+                + "Path: " + busyboxFile.getAbsolutePath()
+                + "\nMake sure jniLibs/arm64-v8a/libbusybox.so exists in the project.");
             return;
         }
 
-        doDownloadAndExtractRootfs();
-    }
+        Log.d(TAG, "proot OK in nativeLibraryDir: " + prootFile.length() + "b");
+        Log.d(TAG, "busybox OK in nativeLibraryDir: " + busyboxFile.length() + "b");
 
-    // -----------------------------------------------------------------------
-    // المرحلة 2: تحميل Alpine minirootfs وفكّه — هذا كان مفقوداً تماماً!
-    // -----------------------------------------------------------------------
-    private void doDownloadAndExtractRootfs() {
         File filesDir  = context.getFilesDir();
         File rootfsDir = new File(filesDir, ROOTFS_DIR);
+        File binSh     = new File(rootfsDir, "bin/sh");
 
-        // التحقق: هل Alpine موجودة مسبقاً (bin/sh)؟
-        File binSh = new File(rootfsDir, "bin/sh");
         if (binSh.exists()) {
-            Log.d(TAG, "Alpine rootfs already extracted, skipping download");
+            Log.d(TAG, "Alpine already extracted");
             doInstallPackages();
             return;
         }
 
+        // تحميل Alpine minirootfs
         File tarFile = new File(filesDir, "alpine-rootfs.tar.gz");
         try {
-            notifyProgress(33, "Downloading Alpine Linux... (تحميل Alpine)");
-            boolean ok = downloadFileWithFallback(ALPINE_ROOTFS_URLS, tarFile, 33, 52);
+            notifyProgress(15, "Downloading Alpine Linux... (تحميل Alpine)");
+            boolean ok = downloadFileWithFallback(ALPINE_ROOTFS_URLS, tarFile, 15, 45);
+
             if (!ok || !tarFile.exists() || tarFile.length() < 500_000) {
                 notifyError("Alpine download failed",
-                    "Could not download Alpine rootfs.\nTried:\n"
-                    + String.join("\n", ALPINE_ROOTFS_URLS));
+                    "Could not download Alpine Linux rootfs.\nCheck internet connection.");
                 return;
             }
-            Log.d(TAG, "Alpine tar OK: " + tarFile.length() + " bytes");
+            Log.d(TAG, "Alpine tar: " + tarFile.length() + " bytes");
 
-            // إنشاء rootfsDir
             if (!rootfsDir.exists()) rootfsDir.mkdirs();
 
-            notifyProgress(54, "Extracting Alpine Linux... (فك ضغط Alpine)");
-            extractTarGz(tarFile, rootfsDir);
+            notifyProgress(48, "Extracting Alpine... (فك الضغط)");
+            extractTarGz(tarFile, rootfsDir, busyboxFile);
             tarFile.delete();
 
-            // التحقق من نجاح الاستخراج
             if (!binSh.exists()) {
-                notifyError("Extract failed",
-                    "Alpine extraction incomplete — /bin/sh not found in rootfs.");
+                notifyError("Extraction failed",
+                    "/bin/sh not found after extraction.\nAlpine rootfs may be corrupted.");
                 return;
             }
             Log.d(TAG, "Alpine extracted OK");
 
         } catch (Exception e) {
-            Log.e(TAG, "Rootfs setup failed", e);
+            Log.e(TAG, "Rootfs setup error", e);
             if (tarFile.exists()) tarFile.delete();
             notifyError("Alpine Setup Failed", e.getMessage());
             return;
@@ -195,83 +179,71 @@ public class TerminalService {
     }
 
     // -----------------------------------------------------------------------
-    // فك ضغط tar.gz باستخدام busybox
+    // فك ضغط tar.gz باستخدام busybox من nativeLibraryDir
     // -----------------------------------------------------------------------
-    private void extractTarGz(File tarFile, File destDir) throws Exception {
-        File busyboxFile = new File(context.getFilesDir(), "busybox");
-
-        // استخدم busybox tar لفك الضغط
+    private void extractTarGz(File tarFile, File destDir, File busyboxFile) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
             busyboxFile.getAbsolutePath(),
             "tar", "-xzf", tarFile.getAbsolutePath(),
             "-C", destDir.getAbsolutePath()
         );
-        pb.environment().put("HOME", "/tmp");
         pb.environment().put("TMPDIR", context.getCacheDir().getAbsolutePath());
         pb.redirectErrorStream(true);
 
         Process proc = pb.start();
+        StringBuilder out = new StringBuilder();
         BufferedReader reader = new BufferedReader(
             new InputStreamReader(proc.getInputStream()));
-        StringBuilder output = new StringBuilder();
         String line;
         while ((line = reader.readLine()) != null) {
-            output.append(line).append("\n");
+            out.append(line).append("\n");
             if (bridge != null) bridge.onTerminalData(line + "\r\n");
         }
         int exit = proc.waitFor();
-        Log.d(TAG, "tar exit=" + exit + " output=" + output.toString().substring(
-            0, Math.min(200, output.length())));
-
+        Log.d(TAG, "tar exit=" + exit);
         if (exit != 0) {
-            throw new Exception("tar extraction failed (exit=" + exit + ")\n" + output);
+            throw new Exception("tar failed (exit=" + exit + ")\n" + out);
         }
     }
 
     // -----------------------------------------------------------------------
-    // المرحلة 3: تثبيت الحزم داخل Alpine
+    // تثبيت الحزم داخل Alpine
     // -----------------------------------------------------------------------
     private void doInstallPackages() {
         try {
             File filesDir  = context.getFilesDir();
             File rootfsDir = new File(filesDir, ROOTFS_DIR);
-            String rootfsPath = rootfsDir.getAbsolutePath();
-            String prootPath  = new File(filesDir, "proot").getAbsolutePath();
-
-            File prootTmp = new File(filesDir, "proot-tmp");
+            File prootFile = getProotFile();
+            File prootTmp  = new File(filesDir, "proot-tmp");
             if (!prootTmp.exists()) prootTmp.mkdirs();
-            String prootTmpPath = prootTmp.getAbsolutePath();
 
-            // إعداد /etc/resolv.conf للشبكة داخل proot
+            String rootfsPath  = rootfsDir.getAbsolutePath();
+            String prootPath   = prootFile.getAbsolutePath();
+            String tmpPath     = prootTmp.getAbsolutePath();
+
+            // إعداد DNS
             setupResolvConf(rootfsDir);
 
-            notifyProgress(58, "Updating package list... (تحديث قائمة الحزم)");
-            boolean ok = runInProot(prootPath, rootfsPath, prootTmpPath,
-                "apk update --no-cache");
+            notifyProgress(52, "Updating packages... (تحديث الحزم)");
+            boolean ok = runInProot(prootPath, rootfsPath, tmpPath, "apk update --no-cache");
             if (!ok) {
-                // محاولة ثانية بعد إصلاح DNS
-                Log.w(TAG, "apk update failed, retrying after DNS fix...");
-                setupResolvConf(rootfsDir);
-                ok = runInProot(prootPath, rootfsPath, prootTmpPath,
-                    "apk update --no-cache");
+                setupResolvConf(rootfsDir); // retry بعد إعادة DNS
+                ok = runInProot(prootPath, rootfsPath, tmpPath, "apk update --no-cache");
             }
             if (!ok) {
-                notifyError("apk update failed",
-                    "Could not reach Alpine package servers.\nCheck internet connection.");
+                notifyError("apk update failed", "Cannot reach Alpine package servers.");
                 return;
             }
 
-            notifyProgress(68, "Installing Node.js & npm... (تثبيت Node.js)");
-            ok = runInProot(prootPath, rootfsPath, prootTmpPath,
-                "apk add --no-cache nodejs npm git");
+            notifyProgress(65, "Installing Node.js... (تثبيت Node.js)");
+            ok = runInProot(prootPath, rootfsPath, tmpPath, "apk add --no-cache nodejs npm git");
             if (!ok) {
                 notifyError("apk add failed", "Could not install nodejs/npm");
                 return;
             }
 
-            notifyProgress(82, "Installing opencode-ai... (تثبيت opencode)");
-            ok = runInProot(prootPath, rootfsPath, prootTmpPath,
-                "npm install -g opencode-ai@latest");
+            notifyProgress(82, "Installing opencode-ai...");
+            ok = runInProot(prootPath, rootfsPath, tmpPath, "npm install -g opencode-ai@latest");
             if (!ok) {
                 notifyError("npm install failed", "Could not install opencode-ai");
                 return;
@@ -280,7 +252,7 @@ public class TerminalService {
             new File(rootfsDir, BOOT_MARKER).createNewFile();
             firstBoot = false;
 
-            notifyProgress(92, "Setup complete! Starting... (اكتمل التثبيت)");
+            notifyProgress(92, "Setup complete! (اكتمل التثبيت)");
             doStartShell();
 
         } catch (Exception e) {
@@ -290,70 +262,32 @@ public class TerminalService {
     }
 
     // -----------------------------------------------------------------------
-    // إعداد DNS داخل rootfs حتى تعمل الشبكة داخل proot
-    // -----------------------------------------------------------------------
     private void setupResolvConf(File rootfsDir) {
         try {
-            File etcDir = new File(rootfsDir, "etc");
-            if (!etcDir.exists()) etcDir.mkdirs();
-            File resolv = new File(etcDir, "resolv.conf");
-            FileOutputStream fos = new FileOutputStream(resolv);
+            File etc = new File(rootfsDir, "etc");
+            if (!etc.exists()) etc.mkdirs();
+            FileOutputStream fos = new FileOutputStream(new File(etc, "resolv.conf"));
             fos.write("nameserver 8.8.8.8\nnameserver 1.1.1.1\n".getBytes("UTF-8"));
             fos.close();
-            Log.d(TAG, "resolv.conf written");
         } catch (Exception e) {
-            Log.w(TAG, "Could not write resolv.conf: " + e.getMessage());
+            Log.w(TAG, "resolv.conf write failed: " + e.getMessage());
         }
     }
 
-    // -----------------------------------------------------------------------
-    // منح صلاحية التنفيذ — setExecutable وحدها لا تكفي على Android
-    // -----------------------------------------------------------------------
-    private void chmodExecutable(File file) {
-        // الطريقة 1: Java API
-        file.setExecutable(true, false);
-        file.setReadable(true, false);
-
-        // الطريقة 2: chmod عبر shell — ضرورية على Android
-        try {
-            Process chmod = Runtime.getRuntime().exec(
-                new String[]{"chmod", "755", file.getAbsolutePath()}
-            );
-            chmod.waitFor();
-            Log.d(TAG, "chmod 755 OK: " + file.getAbsolutePath());
-        } catch (Exception e) {
-            Log.w(TAG, "chmod via Runtime failed: " + e.getMessage());
-            // الطريقة 3: /system/bin/chmod كبديل
-            try {
-                Process chmod2 = Runtime.getRuntime().exec(
-                    new String[]{"/system/bin/chmod", "755", file.getAbsolutePath()}
-                );
-                chmod2.waitFor();
-                Log.d(TAG, "chmod via /system/bin OK");
-            } catch (Exception e2) {
-                Log.w(TAG, "chmod via /system/bin failed: " + e2.getMessage());
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // تحميل مع fallback
     // -----------------------------------------------------------------------
     private boolean downloadFileWithFallback(String[] urls, File outFile,
                                               int startPct, int endPct) {
         for (int i = 0; i < urls.length; i++) {
-            String url = urls[i];
             try {
-                notifyProgress(startPct,
-                    "Source " + (i + 1) + "/" + urls.length + "...");
-                Log.d(TAG, "Downloading: " + url);
-                downloadFile(url, outFile, startPct, endPct);
+                notifyProgress(startPct, "Source " + (i+1) + "/" + urls.length + "...");
+                Log.d(TAG, "Trying: " + urls[i]);
+                downloadFile(urls[i], outFile, startPct, endPct);
                 if (outFile.exists() && outFile.length() > 10_000) {
-                    Log.d(TAG, "✅ OK: " + url + " [" + outFile.length() + "b]");
+                    Log.d(TAG, "✅ OK: " + urls[i]);
                     return true;
                 }
             } catch (Exception e) {
-                Log.w(TAG, "❌ [" + url + "]: " + e.getMessage());
+                Log.w(TAG, "❌ " + urls[i] + ": " + e.getMessage());
             }
             if (outFile.exists()) outFile.delete();
         }
@@ -363,7 +297,6 @@ public class TerminalService {
     private void downloadFile(String urlStr, File outFile, int startPct, int endPct)
             throws Exception {
         if (outFile.exists()) outFile.delete();
-
         URL url = new URL(urlStr);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setInstanceFollowRedirects(true);
@@ -371,13 +304,11 @@ public class TerminalService {
         conn.setReadTimeout(180_000);
         conn.setRequestProperty("User-Agent", "DevPocket/1.0 Android");
         conn.connect();
-
         int code = conn.getResponseCode();
         if (code != HttpURLConnection.HTTP_OK) {
             conn.disconnect();
-            throw new Exception("HTTP " + code + " for " + urlStr);
+            throw new Exception("HTTP " + code);
         }
-
         long total = conn.getContentLengthLong();
         long done  = 0;
         InputStream in  = conn.getInputStream();
@@ -387,10 +318,8 @@ public class TerminalService {
         while ((n = in.read(buf)) != -1) {
             fos.write(buf, 0, n);
             done += n;
-            if (total > 0) {
-                int pct = startPct + (int)((done * (endPct - startPct)) / total);
-                notifyProgress(Math.min(pct, endPct), null);
-            }
+            if (total > 0)
+                notifyProgress(Math.min(startPct + (int)(done*(endPct-startPct)/total), endPct), null);
         }
         fos.flush(); fos.close();
         in.close(); conn.disconnect();
@@ -426,29 +355,25 @@ public class TerminalService {
                 if (bridge != null) bridge.onTerminalData(line + "\r\n");
             }
             int exit = proc.waitFor();
-            Log.d(TAG, "[proot] " + cmd + " => exit=" + exit);
+            Log.d(TAG, "[proot] '" + cmd + "' exit=" + exit);
             return exit == 0;
         } catch (Exception e) {
-            Log.e(TAG, "runInProot failed: " + e.getMessage());
+            Log.e(TAG, "runInProot error: " + e.getMessage());
             return false;
         }
     }
 
     // -----------------------------------------------------------------------
-    // تشغيل الـ shell
-    // -----------------------------------------------------------------------
     private void doStartShell() {
         try {
             File filesDir  = context.getFilesDir();
             File rootfsDir = new File(filesDir, ROOTFS_DIR);
-            File prootFile = new File(filesDir, "proot");
+            File prootFile = getProotFile();
             File prootTmp  = new File(filesDir, "proot-tmp");
             if (!prootTmp.exists()) prootTmp.mkdirs();
 
-            // تأكيد الصلاحيات في كل مرة — قد تُفقد بعد إعادة التشغيل
-            if (prootFile.exists()) chmodExecutable(prootFile);
-            File busyboxFile = new File(filesDir, "busybox");
-            if (busyboxFile.exists()) chmodExecutable(busyboxFile);
+            Log.d(TAG, "Starting shell — proot: " + prootFile.getAbsolutePath()
+                + " canExecute=" + prootFile.canExecute());
 
             ProcessBuilder pb;
             if (prootFile.exists() && rootfsDir.exists()) {
@@ -485,11 +410,11 @@ public class TerminalService {
             startOutputReader(new BufferedReader(
                 new InputStreamReader(shellProcess.getErrorStream())));
 
-            notifyProgress(96, "Launching OpenCode Engine... (بدء تشغيل المحرك)");
+            notifyProgress(96, "Launching OpenCode Engine...");
             writeDirectly("opencode serve\n");
 
         } catch (Exception e) {
-            Log.e(TAG, "Failed to start shell", e);
+            Log.e(TAG, "doStartShell error", e);
             notifyError("Shell Error", e.getMessage());
         }
     }
@@ -507,7 +432,7 @@ public class TerminalService {
                     }
                 }
             } catch (Exception e) {
-                Log.e(TAG, "Reader: " + e.getMessage());
+                Log.e(TAG, "Reader error: " + e.getMessage());
             }
         });
         t.setDaemon(true);
@@ -521,7 +446,7 @@ public class TerminalService {
                 shellInput.flush();
             }
         } catch (Exception e) {
-            Log.e(TAG, "writeDirectly: " + e.getMessage());
+            Log.e(TAG, "writeDirectly error: " + e.getMessage());
         }
     }
 
@@ -533,9 +458,8 @@ public class TerminalService {
         isRunning.set(false);
         writeExecutor.submit(() -> {
             writeDirectly("exit\n");
-            try {
-                if (shellProcess != null) shellProcess.destroy();
-            } catch (Exception ignored) {}
+            try { if (shellProcess != null) shellProcess.destroy(); }
+            catch (Exception ignored) {}
         });
     }
 
