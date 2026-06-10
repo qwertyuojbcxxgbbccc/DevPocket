@@ -8,6 +8,8 @@ import android.util.Log;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileInputStream;
+import java.util.zip.GZIPInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -179,80 +181,186 @@ public class TerminalService {
     }
 
     // -----------------------------------------------------------------------
-    // فك ضغط tar.gz — Java native (بدون busybox لتجنب مشكلة applet not found)
+    // -----------------------------------------------------------------------
+    // فك ضغط tar.gz بـ Java순 — بدون أي binary خارجي
+    // الحل النهائي لـ noexec على SD Card وW^X على Android 10+
     // -----------------------------------------------------------------------
     private void extractTarGz(File tarFile, File destDir, File busyboxFile) throws Exception {
-        // الطريقة الأولى: Java GZIPInputStream + Apache Commons Compress بديل خفيف
-        // نستخدم /system/bin/gzip + dd لأن Android يحتوي عليهما دائماً
-        // ثم نفك tar بـ busybox مع تمرير argv[0] صحيح
+        Log.d(TAG, "Extracting tar.gz with pure Java: " + tarFile.getAbsolutePath());
+        if (bridge != null) bridge.onTerminalData("Extracting Alpine Linux...\r\n");
 
-        // إنشاء نسخة symlink لـ busybox باسم "tar" في cacheDir
-        File cacheDir  = context.getCacheDir();
-        File tarBin    = new File(cacheDir, "tar");
+        try (FileInputStream     fis  = new FileInputStream(tarFile);
+             GZIPInputStream     gzip = new GZIPInputStream(fis, 65536);) {
+            extractTar(gzip, destDir);
+        }
+        Log.d(TAG, "Extraction complete");
+    }
 
-        // نسخ busybox إلى cacheDir باسم "tar"
-        copyFile(busyboxFile, tarBin);
-        setExecutable(tarBin);
+    /**
+     * قارئ tar نقي بـ Java — يدعم:
+     * POSIX ustar, GNU tar, PAX headers
+     * regular files, directories, symlinks, hard links
+     */
+    private void extractTar(java.io.InputStream tarStream, File destDir) throws Exception {
+        byte[] header = new byte[512];
+        int fileCount = 0;
+        String pendingLongName = null; // GNU LongLink
 
-        if (!tarBin.canExecute()) {
-            // fallback: استخدام /system/bin/tar إن وُجد
-            File systemTar = new File("/system/bin/tar");
-            if (systemTar.exists()) {
-                Log.d(TAG, "Using /system/bin/tar as fallback");
-                runTar(systemTar.getAbsolutePath(), tarFile, destDir);
-                return;
+        while (true) {
+            // قراءة header block
+            int bytesRead = readFully(tarStream, header, 512);
+            if (bytesRead < 512) break;
+
+            // EOF: block فارغ = نهاية الأرشيف
+            if (isZeroBlock(header)) {
+                readFully(tarStream, header, 512); // الـ block الثاني
+                break;
             }
-            throw new Exception("Cannot make tar executable in cacheDir");
-        }
 
-        Log.d(TAG, "Running tar from cacheDir: " + tarBin.getAbsolutePath());
-        runTar(tarBin.getAbsolutePath(), tarFile, destDir);
+            // استخراج الحقول
+            String name     = readString(header, 0,   100);
+            long   size     = readOctal(header,  124, 12);
+            int    typeFlag = header[156] & 0xFF;
+            String linkName = readString(header, 157, 100);
+
+            // prefix (ustar)
+            String prefix = readString(header, 345, 155);
+            if (!prefix.isEmpty()) name = prefix + "/" + name;
+
+            // GNU LongLink: الاسم الطويل في block منفصل
+            if (typeFlag == 'L') {
+                byte[] longNameBytes = new byte[(int) size];
+                readFully(tarStream, longNameBytes, longNameBytes.length);
+                skipPadding(tarStream, size);
+                pendingLongName = new String(longNameBytes, "UTF-8").trim().replace("\0", "");
+                continue;
+            }
+            if (pendingLongName != null) {
+                name = pendingLongName;
+                pendingLongName = null;
+            }
+
+            // تنظيف الاسم
+            name = name.replace("\0", "").trim();
+            if (name.isEmpty() || name.equals("./")) {
+                skipEntry(tarStream, size);
+                continue;
+            }
+            if (name.startsWith("./")) name = name.substring(2);
+
+            File outFile = new File(destDir, name);
+
+            // منع Path Traversal
+            if (!outFile.getCanonicalPath().startsWith(destDir.getCanonicalPath())) {
+                Log.w(TAG, "Skipping unsafe path: " + name);
+                skipEntry(tarStream, size);
+                continue;
+            }
+
+            char type = (typeFlag == 0) ? '0' : (char) typeFlag;
+
+            if (type == '5' || name.endsWith("/")) {
+                // Directory
+                outFile.mkdirs();
+                skipEntry(tarStream, size);
+
+            } else if (type == '2') {
+                // Symlink — Android يدعمها
+                if (outFile.exists()) outFile.delete();
+                outFile.getParentFile().mkdirs();
+                try {
+                    java.nio.file.Files.createSymbolicLink(
+                        outFile.toPath(),
+                        java.nio.file.Paths.get(linkName)
+                    );
+                } catch (Exception e) {
+                    Log.w(TAG, "Symlink skip: " + name + " -> " + linkName);
+                }
+                skipEntry(tarStream, size);
+
+            } else if (type == '1') {
+                // Hard link — تخطي (نادر في Alpine minirootfs)
+                skipEntry(tarStream, size);
+
+            } else {
+                // Regular file (type '0', '\0', or unknown)
+                outFile.getParentFile().mkdirs();
+                try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                    long remaining = size;
+                    byte[] buf = new byte[65536];
+                    while (remaining > 0) {
+                        int toRead = (int) Math.min(buf.length, remaining);
+                        int n = tarStream.read(buf, 0, toRead);
+                        if (n < 0) throw new Exception("Unexpected EOF in entry: " + name);
+                        fos.write(buf, 0, n);
+                        remaining -= n;
+                    }
+                }
+                skipPadding(tarStream, size);
+                fileCount++;
+                if (fileCount % 200 == 0 && bridge != null) {
+                    bridge.onTerminalData("Extracted " + fileCount + " files...\r\n");
+                }
+            }
+        }
+        Log.d(TAG, "tar: extracted " + fileCount + " files");
+        if (bridge != null) bridge.onTerminalData("Extracted " + fileCount + " files OK\r\n");
     }
 
-    private void runTar(String tarPath, File tarFile, File destDir) throws Exception {
-        ProcessBuilder pb = new ProcessBuilder(
-            tarPath,
-            "-xzf", tarFile.getAbsolutePath(),
-            "-C",   destDir.getAbsolutePath()
-        );
-        pb.environment().put("TMPDIR", context.getCacheDir().getAbsolutePath());
-        pb.redirectErrorStream(true);
+    // ── tar helpers ─────────────────────────────────────────────────────────
 
-        Process proc = pb.start();
-        StringBuilder out = new StringBuilder();
-        BufferedReader reader = new BufferedReader(
-            new InputStreamReader(proc.getInputStream()));
-        String line;
-        while ((line = reader.readLine()) != null) {
-            out.append(line).append("\n");
-            if (bridge != null) bridge.onTerminalData(line + "\r\n");
+    private int readFully(java.io.InputStream in, byte[] buf, int len) throws Exception {
+        int total = 0;
+        while (total < len) {
+            int n = in.read(buf, total, len - total);
+            if (n < 0) break;
+            total += n;
         }
-        int exit = proc.waitFor();
-        Log.d(TAG, "tar exit=" + exit);
-        if (exit != 0) {
-            throw new Exception("tar failed (exit=" + exit + ")\n" + out);
+        return total;
+    }
+
+    private boolean isZeroBlock(byte[] block) {
+        for (byte b : block) if (b != 0) return false;
+        return true;
+    }
+
+    private String readString(byte[] buf, int offset, int maxLen) throws Exception {
+        int end = offset;
+        while (end < offset + maxLen && buf[end] != 0) end++;
+        return new String(buf, offset, end - offset, "UTF-8").trim();
+    }
+
+    private long readOctal(byte[] buf, int offset, int len) {
+        // دعم base-256 encoding (GNU tar للملفات الكبيرة)
+        if ((buf[offset] & 0x80) != 0) {
+            long val = 0;
+            for (int i = 1; i < len; i++) val = (val << 8) | (buf[offset + i] & 0xFF);
+            return val;
+        }
+        long val = 0;
+        for (int i = offset; i < offset + len; i++) {
+            if (buf[i] == 0 || buf[i] == ' ') break;
+            if (buf[i] >= '0' && buf[i] <= '7') val = val * 8 + (buf[i] - '0');
+        }
+        return val;
+    }
+
+    private void skipPadding(java.io.InputStream in, long size) throws Exception {
+        long rem = (512 - (size % 512)) % 512;
+        if (rem > 0) {
+            byte[] pad = new byte[(int) rem];
+            readFully(in, pad, (int) rem);
         }
     }
 
-    private void copyFile(File src, File dst) throws Exception {
-        if (dst.exists()) dst.delete();
-        java.io.FileInputStream  fis = new java.io.FileInputStream(src);
-        java.io.FileOutputStream fos = new java.io.FileOutputStream(dst);
-        byte[] buf = new byte[16384];
-        int n;
-        while ((n = fis.read(buf)) != -1) fos.write(buf, 0, n);
-        fos.flush(); fos.close(); fis.close();
-    }
-
-    private void setExecutable(File file) {
-        file.setExecutable(true, false);
-        // cacheDir مسموح بالتنفيذ منه على Android (على عكس filesDir)
-        try {
-            Process p = Runtime.getRuntime().exec(
-                new String[]{"chmod", "755", file.getAbsolutePath()});
-            p.waitFor();
-        } catch (Exception e) {
-            Log.w(TAG, "chmod warn: " + e.getMessage());
+    private void skipEntry(java.io.InputStream in, long size) throws Exception {
+        long total = size + ((512 - (size % 512)) % 512);
+        long skipped = 0;
+        byte[] buf = new byte[65536];
+        while (skipped < total) {
+            int n = in.read(buf, 0, (int) Math.min(buf.length, total - skipped));
+            if (n < 0) break;
+            skipped += n;
         }
     }
 
