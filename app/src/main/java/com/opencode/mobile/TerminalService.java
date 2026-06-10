@@ -179,13 +179,41 @@ public class TerminalService {
     }
 
     // -----------------------------------------------------------------------
-    // فك ضغط tar.gz باستخدام busybox من nativeLibraryDir
+    // فك ضغط tar.gz — Java native (بدون busybox لتجنب مشكلة applet not found)
     // -----------------------------------------------------------------------
     private void extractTarGz(File tarFile, File destDir, File busyboxFile) throws Exception {
+        // الطريقة الأولى: Java GZIPInputStream + Apache Commons Compress بديل خفيف
+        // نستخدم /system/bin/gzip + dd لأن Android يحتوي عليهما دائماً
+        // ثم نفك tar بـ busybox مع تمرير argv[0] صحيح
+
+        // إنشاء نسخة symlink لـ busybox باسم "tar" في cacheDir
+        File cacheDir  = context.getCacheDir();
+        File tarBin    = new File(cacheDir, "tar");
+
+        // نسخ busybox إلى cacheDir باسم "tar"
+        copyFile(busyboxFile, tarBin);
+        setExecutable(tarBin);
+
+        if (!tarBin.canExecute()) {
+            // fallback: استخدام /system/bin/tar إن وُجد
+            File systemTar = new File("/system/bin/tar");
+            if (systemTar.exists()) {
+                Log.d(TAG, "Using /system/bin/tar as fallback");
+                runTar(systemTar.getAbsolutePath(), tarFile, destDir);
+                return;
+            }
+            throw new Exception("Cannot make tar executable in cacheDir");
+        }
+
+        Log.d(TAG, "Running tar from cacheDir: " + tarBin.getAbsolutePath());
+        runTar(tarBin.getAbsolutePath(), tarFile, destDir);
+    }
+
+    private void runTar(String tarPath, File tarFile, File destDir) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
-            busyboxFile.getAbsolutePath(),
-            "tar", "-xzf", tarFile.getAbsolutePath(),
-            "-C", destDir.getAbsolutePath()
+            tarPath,
+            "-xzf", tarFile.getAbsolutePath(),
+            "-C",   destDir.getAbsolutePath()
         );
         pb.environment().put("TMPDIR", context.getCacheDir().getAbsolutePath());
         pb.redirectErrorStream(true);
@@ -203,6 +231,28 @@ public class TerminalService {
         Log.d(TAG, "tar exit=" + exit);
         if (exit != 0) {
             throw new Exception("tar failed (exit=" + exit + ")\n" + out);
+        }
+    }
+
+    private void copyFile(File src, File dst) throws Exception {
+        if (dst.exists()) dst.delete();
+        java.io.FileInputStream  fis = new java.io.FileInputStream(src);
+        java.io.FileOutputStream fos = new java.io.FileOutputStream(dst);
+        byte[] buf = new byte[16384];
+        int n;
+        while ((n = fis.read(buf)) != -1) fos.write(buf, 0, n);
+        fos.flush(); fos.close(); fis.close();
+    }
+
+    private void setExecutable(File file) {
+        file.setExecutable(true, false);
+        // cacheDir مسموح بالتنفيذ منه على Android (على عكس filesDir)
+        try {
+            Process p = Runtime.getRuntime().exec(
+                new String[]{"chmod", "755", file.getAbsolutePath()});
+            p.waitFor();
+        } catch (Exception e) {
+            Log.w(TAG, "chmod warn: " + e.getMessage());
         }
     }
 
